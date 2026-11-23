@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright (C) 2026 hui contributors
+# SPDX-License-Identifier: MIT
+#
 # 从 hui/third_party/ninja（上游 ninja 源码 + hui.patch）构建 hui 执行器，
 # 产物安装到 hui/prebuilts/hui/hui。
 #

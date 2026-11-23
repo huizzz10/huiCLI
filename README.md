@@ -11,7 +11,7 @@ AOSP / LineageOS 等类原生 ROM 源码树的构建加速工具，随仓库带�
 
 ```bash
 cd ~/android
-git clone https://github.com/<you>/hui vendor/hui
+git clone https://github.com/huizzz10/HuiCLI.git vendor/hui
 source build/envsetup.sh
 hui nabu-user
 ```
@@ -22,7 +22,7 @@ hui nabu-user
 **装到任意源码树**：
 
 ```bash
-git clone https://github.com/<you>/hui ~/tools/hui
+git clone https://github.com/huizzz10/HuiCLI.git ~/tools/hui
 ~/tools/hui/install.sh ~/android          # 默认软引用，改仓库即生效
 ~/tools/hui/install.sh ~/android --copy   # 拷进去，源码树自包含
 ~/tools/hui/install.sh ~/android -u       # 卸载
@@ -227,12 +227,24 @@ hui/
 ├── tools/build-executor.sh # 从 third_party/ninja 重建执行器
 ├── docs/                   # 执行器方案与 Runa 来源记录
 ├── README.md
-└── LICENSE
+├── LICENSE
+├── LICENSE-APACHE-2.0
+└── THIRD_PARTY_NOTICES.md
 ```
 
 运行时产生的 `<源码树>/.hui/`（内核快照与状态，随时可删）已在 `.gitignore` 里。
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。`third_party/ninja` 与 `prebuilts/` 下的执行器为 Apache-2.0，
-见各自的 `COPYING` / `NOTICE`。
+本仓库自有代码采用 MIT，见 [LICENSE](LICENSE)。
+
+以下组件为 Apache-2.0，见 [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) 和
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：
+
+- `third_party/ninja/`：上游 Ninja v1.12.1 + `hui.patch`
+- `prebuilts/hui/hui`：由上述 Ninja 构建的执行器
+- `prebuilts/runa/runa`：uwuAOSP Runa
+- `lib/admit.py`：运行时准入策略，衍生自 uwuAOSP `uni`
+
+`lib/admit.py` 不适用上面的 MIT 声明，按 Apache-2.0 发布。构建调度策略参考了
+[uwuAOSP/uwuCLI](https://github.com/uwuAOSP/uwuCLI)（Apache-2.0），特此致谢。

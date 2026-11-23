@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 hui contributors
+# SPDX-License-Identifier: MIT
 # shellcheck shell=bash
 #
 # hui.sh — AOSP / 类原生 ROM 构建加速工具

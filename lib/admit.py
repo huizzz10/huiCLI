@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 hui contributors
-# SPDX-License-Identifier: MIT
+# Portions derived from uwuAOSP uni
+# Copyright (C) 2026 The uwuAOSP Project
+# SPDX-License-Identifier: Apache-2.0
 """Runtime admission for Runa's --parallelism-file.
 
 Runa reads the file every 100ms and only limits *new* commands; running
 commands are never interrupted.  This loop lowers the limit under memory
 pressure and raises it again when the machine has genuinely spare capacity.
 
-The policy mirrors the uwuAOSP `uni` admission state machine:
+The policy is derived from the uwuAOSP `uni` admission state machine
+(https://github.com/uwuAOSP/uwuCLI, Apache-2.0):
   * pressure = low MemAvailable + PSI, active swap, linker-heavy phase,
     or MemAvailable below 512MB;
   * sustained pressure (2s / 6s / 20s depending on severity) lowers the

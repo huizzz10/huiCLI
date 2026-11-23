@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright (C) 2026 hui contributors
+# SPDX-License-Identifier: MIT
+#
 # 把 hui 安装进一个 AOSP 源码树。
 #
 #   ./install.sh                 # 装进 $ANDROID_BUILD_TOP 或当前目录

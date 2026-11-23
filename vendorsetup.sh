@@ -1,3 +1,6 @@
+# Copyright (C) 2026 hui contributors
+# SPDX-License-Identifier: MIT
+#
 # hui —— AOSP / LineageOS 构建加速工具
 #
 # build/envsetup.sh 会扫描 device/ vendor/ product/ 下 maxdepth 4 的
@@ -6,11 +9,11 @@
 # 两种用法都能生效：
 #
 #   1) clone 进源码树（推荐，零安装）
-#        cd ~/android && git clone <repo> vendor/hui
+#        cd ~/android && git clone https://github.com/huizzz10/HuiCLI.git vendor/hui
 #        source build/envsetup.sh
 #
 #   2) clone 到别处，再装一次
-#        git clone <repo> ~/tools/hui && ~/tools/hui/install.sh ~/android
+#        git clone https://github.com/huizzz10/HuiCLI.git ~/tools/hui && ~/tools/hui/install.sh ~/android
 #
 # 想手动指定工具位置：export HUI_HOME=/path/to/hui
 
