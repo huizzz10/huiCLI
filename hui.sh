@@ -3959,9 +3959,14 @@ hui__cmd_clean() {
             return 0
         fi
         if [ "$yes" != "1" ]; then
-            printf '将执行 m clean、清 ccache'
+            printf '将执行 m clean'
+            if [ "$do_ccache" = "1" ]; then
+                printf '、清 ccache'
+            else
+                printf '（ccache 保留）'
+            fi
             if [ "$keep_snap" = "1" ]; then
-                printf '（保留内核快照）'
+                printf '、内核快照保留'
             else
                 printf '、清当前产品内核快照'
             fi
@@ -3986,7 +3991,11 @@ hui__cmd_clean() {
             ccache -C >/dev/null 2>&1 || rm -rf --one-file-system -- "$cdir"
         fi
         local done_msg="out/ 已清"
-        [ "$do_ccache" = "1" ] && done_msg="$done_msg、ccache 已清"
+        if [ "$do_ccache" = "1" ]; then
+            done_msg="$done_msg、ccache 已清"
+        else
+            done_msg="$done_msg、ccache 保留"
+        fi
         if [ "$keep_snap" = "1" ]; then
             done_msg="$done_msg、内核快照保留"
         elif [ "$had_snap" = "1" ]; then
