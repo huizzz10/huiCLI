@@ -1,0 +1,6 @@
+.hui/
+*.orig
+__pycache__/
+# 本地改动快照，不上传
+*.bak
+*.bak-*

@@ -1,0 +1,350 @@
+diff --git a/src/build.cc b/src/build.cc
+index 36b52dc..9c20abf 100644
+--- a/src/build.cc
++++ b/src/build.cc
+@@ -453,14 +453,33 @@ void Plan::UnmarkDependents(const Node* node, set<Node*>* dependents) {
+ 
+ namespace {
+ 
++// hui: historical durations (milliseconds) from previous builds. When a
++// duration file was supplied, known edges are weighted by how long they took,
++// which makes ninja's existing critical-path scheduling start the long poles
++// first. Unknown edges keep the default weight of 1.
++static const std::map<std::string, int64_t>* g_duration_table = nullptr;
++
+ // Heuristic for edge priority weighting.
+-// Phony edges are free (0 cost), all other edges are weighted equally.
++// Phony edges are free (0 cost); known edges use their recorded duration;
++// everything else is weighted equally.
+ int64_t EdgeWeightHeuristic(Edge *edge) {
+-  return edge->is_phony() ? 0 : 1;
++  if (edge->is_phony())
++    return 0;
++  if (g_duration_table && !edge->outputs_.empty()) {
++    std::map<std::string, int64_t>::const_iterator it =
++        g_duration_table->find(edge->outputs_[0]->path());
++    if (it != g_duration_table->end())
++      return it->second > 0 ? it->second : 1;
++  }
++  return 1;
+ }
+ 
+ }  // namespace
+ 
++void SetEdgeDurationTable(const std::map<std::string, int64_t>* table) {
++  g_duration_table = table;
++}
++
+ void Plan::ComputeCriticalPath() {
+   METRIC_RECORD("ComputeCriticalPath");
+ 
+@@ -595,15 +614,21 @@ void Plan::Dump() const {
+ }
+ 
+ struct RealCommandRunner : public CommandRunner {
+-  explicit RealCommandRunner(const BuildConfig& config) : config_(config) {}
++  explicit RealCommandRunner(const BuildConfig& config)
++      : config_(config), parallelism_limit_(config.parallelism) {}
+   virtual ~RealCommandRunner() {}
+   virtual size_t CanRunMore() const;
+   virtual bool StartCommand(Edge* edge);
+   virtual bool WaitForCommand(Result* result);
+   virtual vector<Edge*> GetActiveEdges();
+   virtual void Abort();
++  virtual size_t ParallelismLimit() const { return parallelism_limit_; }
++  virtual void SetParallelismLimit(size_t limit) {
++    parallelism_limit_ = limit;
++  }
+ 
+   const BuildConfig& config_;
++  size_t parallelism_limit_;
+   SubprocessSet subprocs_;
+   map<const Subprocess*, Edge*> subproc_to_edge_;
+ };
+@@ -624,7 +649,7 @@ size_t RealCommandRunner::CanRunMore() const {
+   size_t subproc_number =
+       subprocs_.running_.size() + subprocs_.finished_.size();
+ 
+-  int64_t capacity = config_.parallelism - subproc_number;
++  int64_t capacity = (int64_t)parallelism_limit_ - (int64_t)subproc_number;
+ 
+   if (config_.max_load_average > 0.0f) {
+     int load_capacity = config_.max_load_average - GetLoadAverage();
+@@ -765,6 +790,39 @@ bool Builder::AlreadyUpToDate() const {
+   return !plan_.more_to_do();
+ }
+ 
++void Builder::MaybeReloadParallelism() {
++  if (config_.parallelism_file.empty() || !command_runner_.get())
++    return;
++
++  int64_t now = GetTimeMillis();
++  if (now - last_parallelism_reload_millis_ < 200)
++    return;
++  last_parallelism_reload_millis_ = now;
++
++  FILE* file = fopen(config_.parallelism_file.c_str(), "re");
++  if (!file)
++    return;
++  char buf[32];
++  size_t n = fread(buf, 1, sizeof(buf) - 1, file);
++  fclose(file);
++  buf[n] = '\0';
++
++  char* end = NULL;
++  long value = strtol(buf, &end, 10);
++  if (end == buf || value < 1)
++    return;
++
++  size_t limit = (size_t)value;
++  if (limit > (size_t)config_.parallelism)
++    limit = (size_t)config_.parallelism;
++  if (limit == command_runner_->ParallelismLimit())
++    return;
++
++  command_runner_->SetParallelismLimit(limit);
++  if (config_.verbosity == BuildConfig::VERBOSE)
++    fprintf(stderr, "ninja: runtime parallelism limit = %zu\n", limit);
++}
++
+ bool Builder::Build(string* err) {
+   assert(!AlreadyUpToDate());
+   plan_.PrepareQueue();
+@@ -789,6 +847,8 @@ bool Builder::Build(string* err) {
+   // command runner.
+   // Second, we attempt to wait for / reap the next finished command.
+   while (plan_.more_to_do()) {
++    MaybeReloadParallelism();
++
+     // See if we can start any more commands.
+     if (failures_allowed) {
+       size_t capacity = command_runner_->CanRunMore();
+diff --git a/src/build.h b/src/build.h
+index 471f0b2..6c04a0f 100644
+--- a/src/build.h
++++ b/src/build.h
+@@ -148,6 +148,11 @@ struct CommandRunner {
+   virtual size_t CanRunMore() const = 0;
+   virtual bool StartCommand(Edge* edge) = 0;
+ 
++  /// Runtime parallelism limit set through --parallelism-file.
++  /// SIZE_MAX means the runner does not support runtime limiting.
++  virtual size_t ParallelismLimit() const { return SIZE_MAX; }
++  virtual void SetParallelismLimit(size_t limit) { (void)limit; }
++
+   /// The result of waiting for a command.
+   struct Result {
+     Result() : edge(NULL) {}
+@@ -177,6 +182,8 @@ struct BuildConfig {
+   Verbosity verbosity;
+   bool dry_run;
+   int parallelism;
++  /// File polled for a runtime parallelism limit (--parallelism-file).
++  std::string parallelism_file;
+   int failures_allowed;
+   /// The maximum load average we must not exceed. A negative value
+   /// means that we do not have any limit.
+@@ -184,6 +191,10 @@ struct BuildConfig {
+   DepfileParserOptions depfile_parser_options;
+ };
+ 
++/// hui: optional table of historical edge durations (milliseconds) keyed by
++/// the first output path of an edge, used as the scheduling heuristic.
++void SetEdgeDurationTable(const std::map<std::string, int64_t>* table);
++
+ /// Builder wraps the build process: starting commands, updating status.
+ struct Builder {
+   Builder(State* state, const BuildConfig& config,
+@@ -210,6 +221,9 @@ struct Builder {
+ 
+   bool StartEdge(Edge* edge, std::string* err);
+ 
++  /// Re-read config_.parallelism_file and apply the limit to the runner.
++  void MaybeReloadParallelism();
++
+   /// Update status ninja logs following a command termination.
+   /// @return false if the build can not proceed further due to a fatal error.
+   bool FinishCommand(CommandRunner::Result* result, std::string* err);
+@@ -227,6 +241,7 @@ struct Builder {
+   Plan plan_;
+   std::unique_ptr<CommandRunner> command_runner_;
+   Status* status_;
++  int64_t last_parallelism_reload_millis_ = 0;
+ 
+  private:
+   bool ExtractDeps(CommandRunner::Result* result, const std::string& deps_type,
+diff --git a/src/ninja.cc b/src/ninja.cc
+index ce1beda..906c605 100644
+--- a/src/ninja.cc
++++ b/src/ninja.cc
+@@ -79,6 +79,9 @@ struct Options {
+ 
+   /// Whether phony cycles should warn or print an error.
+   bool phony_cycle_should_err;
++
++  /// Optional file with historical edge durations (hui).
++  const char* duration_file;
+ };
+ 
+ /// The Ninja main() loads up a series of data structures; various tools need
+@@ -228,6 +231,10 @@ void Usage(const BuildConfig& config) {
+ "  -f FILE  specify input build file [default=build.ninja]\n"
+ "\n"
+ "  -j N     run N jobs in parallel (0 means infinity) [default=%d on this system]\n"
++"  --parallelism-file FILE  read a runtime job limit from FILE; only affects\n"
++"                           edges that have not started yet\n"
++"  --duration-file FILE     read historical edge durations (ms) from FILE and\n"
++"                           use them to schedule long edges first\n"
+ "  -k N     keep going until N jobs fail (0 means infinity) [default=1]\n"
+ "  -l N     do not start new jobs if the load average is greater than N\n"
+ "  -n       dry run (don't run commands but act like they succeeded)\n"
+@@ -1430,18 +1437,112 @@ class DeferGuessParallelism {
+   ~DeferGuessParallelism() { Refresh(); }
+ };
+ 
++/// hui: per-class runtime pools.
++/// HUI_POOL_<CLASS>_JOBS=N caps how many commands of that class run at once.
++/// Edges are classified by their rule name, and explicit pool= assignments
++/// from the manifest are left untouched.
++static void SetupHuiPools(State* state) {
++  struct PoolSpec {
++    const char* env;
++    const char* name;
++    const char* rule_match;
++  };
++  static const PoolSpec kSpecs[] = {
++      {"HUI_POOL_R8_JOBS", "hui_r8", "r8"},
++      {"HUI_POOL_KOTLIN_JOBS", "hui_kotlin", "kotlin"},
++      {"HUI_POOL_JAVA_JOBS", "hui_java", "javac"},
++      {"HUI_POOL_RUST_JOBS", "hui_rust", "rust"},
++      {"HUI_POOL_LINK_JOBS", "hui_link", ".ld"},
++  };
++  std::vector<Pool*> pools;
++  std::vector<std::string> matches;
++  for (const PoolSpec& spec : kSpecs) {
++    const char* value = getenv(spec.env);
++    if (!value || !*value)
++      continue;
++    int depth = atoi(value);
++    if (depth <= 0)
++      continue;
++    Pool* pool = new Pool(spec.name, depth);
++    state->AddPool(pool);
++    pools.push_back(pool);
++    matches.push_back(spec.rule_match);
++  }
++  if (pools.empty())
++    return;
++
++  std::map<const Rule*, Pool*> rule_pools;
++  size_t assigned = 0;
++  for (Edge* edge : state->edges_) {
++    if (!edge->rule_ || edge->pool_ != &State::kDefaultPool)
++      continue;
++    std::map<const Rule*, Pool*>::iterator it = rule_pools.find(edge->rule_);
++    if (it == rule_pools.end()) {
++      const std::string& rule_name = edge->rule_->name();
++      Pool* pool = NULL;
++      for (size_t i = 0; i < pools.size(); i++) {
++        if (rule_name.find(matches[i]) != std::string::npos) {
++          pool = pools[i];
++          break;
++        }
++      }
++      it = rule_pools.insert(std::make_pair(edge->rule_, pool)).first;
++    }
++    if (it->second) {
++      edge->pool_ = it->second;
++      assigned++;
++    }
++  }
++  if (getenv("HUI_POOL_DEBUG"))
++    fprintf(stderr, "hui: per-class pools active, %zu edges assigned\n",
++            assigned);
++}
++
++/// hui: load "<milliseconds>\t<output path>" lines into |table|.
++static bool LoadDurationFile(const char* path,
++                             std::map<std::string, int64_t>* table) {
++  FILE* file = fopen(path, "re");
++  if (!file)
++    return false;
++  char* line = NULL;
++  size_t capacity = 0;
++  ssize_t length;
++  while ((length = getline(&line, &capacity, file)) >= 0) {
++    if (line[0] == '#' || line[0] == '\n')
++      continue;
++    char* end = NULL;
++    long long ms = strtoll(line, &end, 10);
++    if (end == line || ms <= 0)
++      continue;
++    while (*end == '\t' || *end == ' ')
++      ++end;
++    if (*end == '\0' || *end == '\n')
++      continue;
++    char* newline = strchr(end, '\n');
++    if (newline)
++      *newline = '\0';
++    (*table)[end] = ms;
++  }
++  free(line);
++  fclose(file);
++  return true;
++}
++
+ /// Parse argv for command-line options.
+ /// Returns an exit code, or -1 if Ninja should continue.
+ int ReadFlags(int* argc, char*** argv,
+               Options* options, BuildConfig* config) {
+   DeferGuessParallelism deferGuessParallelism(config);
+ 
+-  enum { OPT_VERSION = 1, OPT_QUIET = 2 };
++  enum { OPT_VERSION = 1, OPT_QUIET = 2, OPT_PARALLELISM_FILE = 3,
++         OPT_DURATION_FILE = 4 };
+   const option kLongOptions[] = {
+     { "help", no_argument, NULL, 'h' },
+     { "version", no_argument, NULL, OPT_VERSION },
+     { "verbose", no_argument, NULL, 'v' },
+     { "quiet", no_argument, NULL, OPT_QUIET },
++    { "parallelism-file", required_argument, NULL, OPT_PARALLELISM_FILE },
++    { "duration-file", required_argument, NULL, OPT_DURATION_FILE },
+     { NULL, 0, NULL, 0 }
+   };
+ 
+@@ -1457,6 +1558,12 @@ int ReadFlags(int* argc, char*** argv,
+       case 'f':
+         options->input_file = optarg;
+         break;
++      case OPT_PARALLELISM_FILE:
++        config->parallelism_file = optarg;
++        break;
++      case OPT_DURATION_FILE:
++        options->duration_file = optarg;
++        break;
+       case 'j': {
+         char* end;
+         int value = strtol(optarg, &end, 10);
+@@ -1540,6 +1647,13 @@ NORETURN void real_main(int argc, char** argv) {
+   if (exit_code >= 0)
+     exit(exit_code);
+ 
++  // hui: optional historical durations for scheduling priorities.
++  static std::map<std::string, int64_t> duration_table;
++  if (options.duration_file &&
++      LoadDurationFile(options.duration_file, &duration_table) &&
++      !duration_table.empty())
++    SetEdgeDurationTable(&duration_table);
++
+   Status* status = new StatusPrinter(config);
+ 
+   if (options.working_dir) {
+@@ -1578,6 +1692,8 @@ NORETURN void real_main(int argc, char** argv) {
+       exit(1);
+     }
+ 
++    SetupHuiPools(&ninja.state_);
++
+     if (options.tool && options.tool->when == Tool::RUN_AFTER_LOAD)
+       exit((ninja.*options.tool->func)(&options, argc, argv));
+ 

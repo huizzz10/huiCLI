@@ -1,0 +1,12 @@
+hui executor
+
+Built from ninja v1.12.1 (https://github.com/ninja-build/ninja),
+Apache-2.0, with hui.patch from hui/third_party/ninja.
+
+Local changes:
+  * --parallelism-file FILE: read a runtime job limit from FILE without
+    interrupting running commands (only affects edges that have not started).
+  * HUI_POOL_<CLASS>_JOBS=N: cap the number of concurrent commands of a class
+    (r8 / kotlin / javac / rust / .ld), classified by rule name.
+
+Rebuild with hui/tools/build-executor.sh.

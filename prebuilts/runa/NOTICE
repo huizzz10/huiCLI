@@ -1,0 +1,11 @@
+Runa (ninja-compatible build executor)
+Copyright (C) 2026 The uwuAOSP Project
+Licensed under the Apache License, Version 2.0 (see COPYING).
+
+Upstream source: uwuAOSP external/runa
+Source revision: ec2a20576ebac608bc527ccb0fa9571221cd47d7
+Prebuilt: vendor/uwu-prebuilts/runa/runa (linux x86_64)
+SHA-256: 7aab8d67e0bfcf3423c0dddaaaf54fe3a3a178d9b08701bde887bc8c47ce667d
+Used by hui for runtime-capped parallelism (--parallelism-file).
+
+Provenance / reproducibility notes: ../../docs/runa-provenance.md
