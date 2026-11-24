@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.4.1"
+HUI_VERSION="5.4.2"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -4032,34 +4032,89 @@ hui__fmt_dur() {
     fi
 }
 
-# 构建收尾摘要：一行标题 + 阶段 / 缓存 / 日志，替代原来散落的
-# 「✓ 构建成功，用时…」+「构建图完成 · 内核完成 · ROM完成」+ 缓存提示。
+# 终端列数：优先 COLUMNS（交互 shell 会随窗口更新），其次 tput，最后 80
+hui__term_cols() {
+    local w=${COLUMNS:-}
+    case "$w" in ''|*[!0-9]*) w=$(tput cols 2>/dev/null) ;; esac
+    case "$w" in ''|*[!0-9]*) w=80 ;; esac
+    [ "$w" -lt 20 ] && w=20
+    [ "$w" -gt 100 ] && w=100
+    printf '%s' "$w"
+}
+
+# 一个字符串的显示列宽（中文、… 按终端列算；拿不到 wc -L 就退回字符数）
+hui__wlen() {
+    local n
+    n=$(printf '%s' "$1" | wc -L 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=${#1} ;; esac
+    printf '%s' "$n"
+}
+
+# 按显示列宽截断到 n 列：head 保留开头，tail 保留结尾（日志文件名在结尾）
+hui__fit_w() {
+    local s=$1 n=$2 mode=${3:-head} len ew target keep cut
+    case "$n" in ''|*[!0-9]*) n=60 ;; esac
+    [ "$n" -lt 6 ] && n=6
+    len=$(hui__wlen "$s")
+    [ "$len" -le "$n" ] && { printf '%s' "$s"; return 0; }
+    ew=$(hui__wlen "…")
+    [ "$ew" -lt 1 ] && ew=1
+    target=$((n - ew))
+    [ "$target" -lt 1 ] && target=1
+    if [ "$mode" = "tail" ]; then
+        keep=$target
+        while [ "$keep" -gt 1 ] && \
+            [ "$(hui__wlen "$(printf '%s' "$s" | rev | cut -c1-"$keep" | rev)")" -gt "$target" ]; do
+            keep=$((keep - 1))
+        done
+        printf '…%s' "$(printf '%s' "$s" | rev | cut -c1-"$keep" | rev)"
+    else
+        cut=$(printf '%s' "$s" | cut -c1-"$target")
+        while [ "${#cut}" -gt 1 ] && [ "$(hui__wlen "$cut")" -gt "$target" ]; do
+            cut=$(printf '%s' "$cut" | cut -c1-$(( ${#cut} - 1 )))
+        done
+        printf '%s…' "$cut"
+    fi
+}
+
+# 构建收尾摘要：行宽跟终端走；日志路径过长时保留尾部（文件名），
+# 其余行截断并加 …，保证整块都在分隔线以内。
 hui__build_summary() {
     local rc=$1 total=$2 rom_s=$3
-    local line log state mark
-    line=$(printf '─%.0s' $(seq 1 64))
+    local w av hdr line log state mark mchar pfx dur
+    w=$(hui__term_cols)
+    line=$(printf '─%.0s' $(seq 1 "$w"))
     log=$(cat "${HUI_STATE:-$HUI_TOP/.hui}/.last-phase-log" 2>/dev/null)
     [ -n "$log" ] || log=${HUI__LOG_FILE:-}
     [ -n "$log" ] && log=${log#$HUI_TOP/}
+    dur=$(printf '%dh%02dm' $((total / 3600)) $((total % 3600 / 60)))
     printf '\n%s%s%s\n' "$hui__c_dim" "$line" "$hui__c_rst" >&2
+
     if [ "$rc" -eq 0 ]; then
-        mark="${hui__c_grn}✓${hui__c_rst}"
-        printf '%s[hui]%s %s 构建成功 · 总用时 %dh%02dm · ROM %s\n' \
-            "$hui__c_dim" "$hui__c_rst" "$mark" \
-            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+        mchar="✓"
+        mark="${hui__c_grn}${mchar}${hui__c_rst}"
+        hdr="构建成功 · 总用时 ${dur} · ROM $(hui__fmt_dur "$rom_s")"
     elif [ "$rc" -eq 130 ]; then
-        mark="${hui__c_yel}■${hui__c_rst}"
-        printf '%s[hui]%s %s 构建已中断 · 总用时 %dh%02dm · ROM %s\n' \
-            "$hui__c_dim" "$hui__c_rst" "$mark" \
-            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+        mchar="■"
+        mark="${hui__c_yel}${mchar}${hui__c_rst}"
+        hdr="构建已中断 · 总用时 ${dur} · ROM $(hui__fmt_dur "$rom_s")"
     else
-        mark="${hui__c_red}✗${hui__c_rst}"
-        printf '%s[hui]%s %s 构建失败 rc=%s · 总用时 %dh%02dm · ROM %s\n' \
-            "$hui__c_dim" "$hui__c_rst" "$mark" "$rc" \
-            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+        mchar="✗"
+        mark="${hui__c_red}${mchar}${hui__c_rst}"
+        hdr="构建失败 rc=${rc} · 总用时 ${dur} · ROM $(hui__fmt_dur "$rom_s")"
     fi
+    pfx="[hui] ${mchar} "
+    av=$((w - $(hui__wlen "$pfx")))
+    [ "$av" -lt 6 ] && av=6
+    printf '%s[hui]%s %s %s\n' "$hui__c_dim" "$hui__c_rst" "$mark" \
+        "$(hui__fit_w "$hdr" "$av" head)" >&2
+
+    pfx="[hui]   阶段  "
+    av=$((w - $(hui__wlen "$pfx")))
+    [ "$av" -lt 6 ] && av=6
     state="构建图 ${HUI__GRAPH_STATE:-?} · 内核 ${HUI__KERNEL_STATE:-?}"
-    printf '%s[hui]%s   阶段  %s\n' "$hui__c_dim" "$hui__c_rst" "$state" >&2
+    printf '%s[hui]%s   阶段  %s\n' "$hui__c_dim" "$hui__c_rst" \
+        "$(hui__fit_w "$state" "$av" head)" >&2
     state=""
     case "${HUI__SAVE_STATE:-}" in
         skip)     state="内核快照已是最新${HUI__SAVE_FP:+（${HUI__SAVE_FP}）}" ;;
@@ -4068,8 +4123,10 @@ hui__build_summary() {
         prebuilt) state="预编译内核，无需快照" ;;
     esac
     [ "$rc" -eq 0 ] && [ -n "$state" ] && \
-        printf '%s[hui]%s   缓存  %s\n' "$hui__c_dim" "$hui__c_rst" "$state" >&2
-    [ -n "$log" ] && printf '%s[hui]%s   日志  %s\n' "$hui__c_dim" "$hui__c_rst" "$log" >&2
+        printf '%s[hui]%s   缓存  %s\n' "$hui__c_dim" "$hui__c_rst" \
+            "$(hui__fit_w "$state" "$av" head)" >&2
+    [ -n "$log" ] && printf '%s[hui]%s   日志  %s\n' "$hui__c_dim" "$hui__c_rst" \
+        "$(hui__fit_w "$log" "$av" tail)" >&2
     printf '%s%s%s\n' "$hui__c_dim" "$line" "$hui__c_rst" >&2
     return 0
 }
