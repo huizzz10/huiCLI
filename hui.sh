@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.4.0"
+HUI_VERSION="5.4.1"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -2689,7 +2689,7 @@ hui__reap_build_tree() {
     return 0
 }
 
-# 阶段日志路径：<OUT_DIR>/hui/<codename>/hui-build-<产品>-<时间>.log
+# 阶段日志路径：<OUT_DIR>/hui/<codename>/hui-<产品>-<时间>.log
 # 面板和非面板路径共用。目录建不出来时退到 OUT_DIR 根下；返回的路径仍可能
 # 写不进去，调用方负责 `: >|` 失败后再回退 mktemp。
 hui__log_file_new() {
@@ -2708,7 +2708,7 @@ hui__log_file_new() {
     }
     # 同一秒内起两个阶段（例如快速失败后重试）时别互相覆盖：重名就加 -2/-3
     local base f n=2
-    base="$d/hui-build-${HUI__PRODUCT:-unknown}-$(date '+%Y%m%d-%H%M%S')"
+    base="$d/hui-${HUI__PRODUCT:-unknown}-$(date '+%Y%m%d-%H%M%S')"
     f="$base.log"
     while [ -e "$f" ]; do f="$base-$n.log"; n=$((n + 1)); done
     printf '%s' "$f"
@@ -2737,7 +2737,7 @@ hui__run_phase_dashboard() {
             exec 2>/dev/tty
         fi
 
-        # 日志按 codename 归档：<OUT_DIR>/hui/<codename>/hui-build-<产品>-<时间>.log
+        # 日志按 codename 归档：<OUT_DIR>/hui/<codename>/hui-<产品>-<时间>.log
         HUI__BUILD_START=$(date '+%Y-%m-%d %H:%M:%S')
         HUI__PHASE_LABEL=$label
         HUI__TARGET=${HUI__TARGET:-${*}}

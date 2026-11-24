@@ -82,7 +82,7 @@ Tab 补全载入时自动注册（bash `complete -F`、zsh `compdef`），子命
 构图阶段（kati + soong 分析）同样在面板里，进度行显示子阶段和已用时间，右下改刷最新输出；
 终端太窄或太矮会自动退回普通输出。
 
-没有面板时（管道/CI/终端太小）输出照样会落到 `<OUT_DIR>/hui/<codename>/hui-build-*.log`，
+没有面板时（管道/CI/终端太小）输出照样会落到 `<OUT_DIR>/hui/<codename>/hui-*.log`，
 失败时打印「失败报错」摘要和完整日志路径。内核/ROM 阶段如果像被内存打爆
 （`Error 137` / `已杀死` / `Killed process` / `oom-kill`），会自动降 3 路并发重试一次，
 增量续跑剩下的边。
