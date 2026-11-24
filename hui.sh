@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.2.0"
+HUI_VERSION="5.4.0"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -275,9 +275,12 @@ hui__build_lock() {
     local f="${HUI_STATE:-$HUI_TOP/.hui}/build.lock"
     command -v flock >/dev/null 2>&1 || return 0
     mkdir -p "${f%/*}" 2>/dev/null
-    exec 9>>"$f" 2>/dev/null || return 0
+    # 注意：exec 带 2>/dev/null 会把当前 shell 的 stderr 永久改成 /dev/null，
+    # 之后所有 hui__warn/hui__err/摘要都看不到。这里用 { } 把静音限制在打开 fd9
+    # 这一步，fd9 本身仍然留在当前 shell。
+    { exec 9>>"$f"; } 2>/dev/null || return 0
     if ! flock -n 9 2>/dev/null; then
-        exec 9>&- 2>/dev/null
+        { exec 9>&-; } 2>/dev/null
         hui__err "已有另一个 hui 构建在跑（锁文件 $f）"
         hui__dim "  同时跑两个构建会互清内核完成标记、抢内存；等前一个结束再试"
         hui__dim "  确认前一个已经退出但锁还在：查一下还有没有 hui/m/ninja/runa 进程"
@@ -289,7 +292,7 @@ hui__build_lock() {
 
 hui__build_unlock() {
     [ "${HUI__LOCK_HELD:-0}" = "1" ] || return 0
-    exec 9>&- 2>/dev/null
+    { exec 9>&-; } 2>/dev/null
     HUI__LOCK_HELD=0
 }
 
@@ -367,6 +370,30 @@ hui__kernel_vars() {
     HUI__KV=$(get_build_var TARGET_KERNEL_VERSION 2>/dev/null)
     HUI__KEXT=$(get_build_var TARGET_KERNEL_EXT_MODULES 2>/dev/null)
     HUI__KV_LOADED=1
+    return 0
+}
+
+# 面板配置表要的字段（PLATFORM / BUILD_ID / PATCH / GMS）：
+# 前三个优先 out/.../system/build.prop（构建产物，带 PRODUCT_BUILD_PROP_OVERRIDES，最准）；
+# 没有就退回 get_build_var —— 刚清过 out/ 或正在构图时 build.prop 还不存在，
+# 只读它的话面板会显示三个「?」，看着像坏了。
+# 每个 shell 只取一次，缓存在 HUI__PLATFORM / HUI__BUILD_ID / HUI__PATCH / HUI__WITH_GMS。
+hui__panel_config() {
+    [ -n "${HUI__PANEL_CFG:-}" ] && return 0
+    HUI__PANEL_CFG=1
+    local bp dev
+    dev=${HUI__DEV:-${HUI__PRODUCT##*_}}
+    bp="$HUI_TOP/out/target/product/$dev/system/build.prop"
+    if [ -r "$bp" ]; then
+        HUI__PLATFORM=$(sed -n 's/^ro.build.version.release=//p' "$bp" 2>/dev/null | head -1)
+        HUI__BUILD_ID=$(sed -n 's/^ro.build.id=//p' "$bp" 2>/dev/null | head -1)
+        HUI__PATCH=$(sed -n 's/^ro.build.version.security_patch=//p' "$bp" 2>/dev/null | head -1)
+    fi
+    command -v get_build_var >/dev/null 2>&1 || return 0
+    [ -n "${HUI__PLATFORM:-}" ] || HUI__PLATFORM=$(get_build_var PLATFORM_VERSION 2>/dev/null)
+    [ -n "${HUI__BUILD_ID:-}" ] || HUI__BUILD_ID=$(get_build_var BUILD_ID 2>/dev/null)
+    [ -n "${HUI__PATCH:-}" ] || HUI__PATCH=$(get_build_var PLATFORM_SECURITY_PATCH 2>/dev/null)
+    [ -n "${HUI__WITH_GMS:-}" ] || HUI__WITH_GMS=$(get_build_var WITH_GMS 2>/dev/null)
     return 0
 }
 
@@ -552,6 +579,8 @@ hui__kernel_image() {
 }
 
 hui__save() {
+    HUI__SAVE_STATE=""
+    HUI__SAVE_FP=""
     hui__kernel_vars || return 1
     local force=${1:-}
     case "$force" in
@@ -561,6 +590,7 @@ hui__save() {
            return 1 ;;
     esac
     if [ -z "$HUI__KS" ]; then
+        HUI__SAVE_STATE="prebuilt"
         hui__say "该产品用预编译内核（TARGET_KERNEL_SOURCE 为空），无需缓存"
         return 0
     fi
@@ -589,13 +619,16 @@ hui__save() {
     local dst="$root/$fp"
 
     if [ -d "$dst" ] && [ "$force" != "--force" ]; then
-        hui__dim "内核缓存已是当前指纹（$(hui__short "$fp")），不重复保存"
+        HUI__SAVE_STATE="skip"
+        HUI__SAVE_FP=$(hui__short "$fp")
+        [ "${HUI__SAVE_QUIET:-0}" = "1" ] || \
+            hui__dim "  内核快照已是最新（$(hui__short "$fp")），跳过保存"
         hui__prune_keep "$root" "$dst"
         rm -rf "${HUI__MANIFEST_TMP:-}" 2>/dev/null
         return 0
     fi
 
-    hui__say "保存内核快照 $(hui__short "$fp") …"
+    [ "${HUI__SAVE_QUIET:-0}" = "1" ] || hui__say "保存内核快照 $(hui__short "$fp") …"
     rm -rf -- "$dst"
     mkdir -p -- "$dst" || return 1
 
@@ -620,8 +653,11 @@ hui__save() {
     } >| "$dst/meta"
 
     ( cd "$root" && ln -sfn "$fp" latest )
+    HUI__SAVE_STATE="saved"
+    HUI__SAVE_FP=$(hui__short "$fp")
     hui__prune "$root"
-    hui__ok "内核快照已保存：$(hui__human "$(du -sb -- "$dst" 2>/dev/null | cut -f1)") 逻辑大小（reflink，实际占用接近 0）"
+    [ "${HUI__SAVE_QUIET:-0}" = "1" ] || \
+        hui__ok "内核快照已保存：$(hui__human "$(du -sb -- "$dst" 2>/dev/null | cut -f1)") 逻辑大小（reflink，实际占用接近 0）"
     return 0
 }
 
@@ -671,7 +707,7 @@ hui__restore() {
     local ko="$po/obj/KERNEL_OBJ"
 
     if hui__kernel_ready "$po"; then
-        hui__ok "内核产物已在位（内核阶段完整跑完），ninja 不会重编"
+        hui__ok "内核产物已在位，跳过编译"
         return 0
     fi
 
@@ -1937,12 +1973,19 @@ hui__dash_left_pane() {
     fi
 
     # 构建配置要用的几项（原样配置块用）：Android 版本 / BUILD_ID / 安全补丁
+    # build.prop 优先（构建产物最准）；还没构建过（比如正在构图）就用
+    # hui__panel_config 从 get_build_var 取的当前配置，别让面板只剩「?」。
     ver=""; id=""; patch=""
     bp="$HUI_TOP/out/target/product/${HUI__DEV:-${HUI__PRODUCT##*_}}/system/build.prop"
     if [ -r "$bp" ]; then
         ver=$(sed -n 's/^ro.build.version.release=//p' "$bp" 2>/dev/null | head -1)
         id=$(sed -n 's/^ro.build.id=//p' "$bp" 2>/dev/null | head -1)
         patch=$(sed -n 's/^ro.build.version.security_patch=//p' "$bp" 2>/dev/null | head -1)
+    fi
+    if [ -z "$ver" ] || [ -z "$id" ] || [ -z "$patch" ]; then
+        [ -n "$ver" ]   || ver=${HUI__PLATFORM:-}
+        [ -n "$id" ]    || id=${HUI__BUILD_ID:-}
+        [ -n "$patch" ] || patch=${HUI__PATCH:-}
     fi
 
 
@@ -1981,7 +2024,11 @@ hui__dash_prod_pane() {
     snap=$(hui__cache_latest 2>/dev/null)
     snaptxt="无"; [ -n "$snap" ] && snaptxt=$(hui__short "$snap" 8)
     graph="缺失"
-    [ -n "${HUI__PRODUCT:-}" ] && [ -f "$HUI_TOP/out/soong/build.$HUI__PRODUCT.ninja" ] && graph="已就绪"
+    if [ "${HUI__PHASE_MODE:-build}" = "graph" ]; then
+        graph="生成中"
+    elif [ -n "${HUI__PRODUCT:-}" ] && [ -f "$HUI_TOP/out/soong/build.$HUI__PRODUCT.ninja" ]; then
+        graph="已就绪"
+    fi
 
     {
         printf ' %s%s产品信息%s\n' "$hui__c_bld" "$hui__c_cyn" "$hui__c_rst"
@@ -2002,7 +2049,7 @@ hui__dash_prod_pane() {
 
         local bw=$(( rw - 16 ))
         [ "$bw" -lt 6 ] && bw=6
-        if [ -n "${HUI__PROG_PCT:-}" ]; then
+        if [ -n "${HUI__PROG_PCT:-}" ] && [ "${HUI__PHASE_MODE:-build}" != "graph" ]; then
             printf ' %s%-6s%s [%s%s%s] %3s%%\n' "$hui__c_cyn" "PROG" "$hui__c_rst" \
                 "${HUI__PROG_COLOR:-${HUI__THEME_ACCENT:-$hui__c_blu}}" "$(hui__bar "$HUI__PROG_PCT" "$bw")" \
                 "$hui__c_rst" "$HUI__PROG_PCT"
@@ -2133,16 +2180,73 @@ hui__dash_recent() {
         ' >| "$out" 2>/dev/null
 }
 
+# 构图阶段在跑什么：没有 ninja 边可数，只能看谁还活着。
+# 由面板约每秒调一次（构图时机器很忙，别每帧都扫 /proc），结果缓存在 HUI__GRAPH_STAGE。
+hui__graph_stage() {
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x soong_build >/dev/null 2>&1; then
+            printf 'soong 分析'
+            return 0
+        fi
+        if pgrep -x ckati >/dev/null 2>&1; then
+            printf 'kati 配置'
+            return 0
+        fi
+        if pgrep -x soong_ui >/dev/null 2>&1; then
+            printf 'soong bootstrap'
+            return 0
+        fi
+    fi
+    printf '分析中'
+}
+
+# 构图阶段的「最新输出」：此时 .ninja_log 还是上一次构建的，读它会显示陈旧动作；
+# 直接截日志尾部，去掉空行/配置块，最后 n 行铺进右下框。
+hui__graph_recent() {
+    local log=$1 n=$2 cols=$3
+    local out=${HUI__DASH_RECENT:-/dev/null} w
+    : >| "$out" 2>/dev/null
+    w=$(( cols - 1 )); [ "$w" -lt 16 ] && return 0
+    [ "$n" -lt 1 ] && return 0
+    tail -c 131072 -- "$log" 2>/dev/null |
+        tr '\r' '\n' |
+        sed -e 's/\033\[[0-9;?]*[a-zA-Z]//g' -e 's/\033//g' |
+        LC_ALL=C tr -d '\001-\010\013\014\016-\037\177' |
+        awk -v n="$n" -v w="$w" '
+            function elide(s) {
+                if (w > 4 && length(s) > w) {
+                    s = substr(s, 1, w - 2)
+                    gsub(/[^ -~]+$/, "", s)
+                    s = s "…"
+                }
+                return s
+            }
+            BEGIN { k = 0 }
+            /^[[:space:]]*$/ { next }
+            /^[A-Z][A-Z0-9_]*=/ { next }
+            /^=+$/ { next }
+            { gsub(/\t/, "    "); buf[k % n] = $0; k++ }
+            END {
+                start = k - n
+                if (start < 0) start = 0
+                for (i = start; i < k; i++) printf "%s\n", elide(buf[i % n])
+            }
+        ' >| "$out" 2>/dev/null
+}
+
 hui__dash_draw() {
     local label=$1 jobs=$2 log=$3 off=${4:-0} tick=${5:-0}
     local sz rows cols lw rw r line lh rh top_h log_rows rcol prog pct acc
-    local recent_h=0 rh2=0 sep_row=0 log_end=0 rebuild=1
+    local recent_h=0 rh2=0 sep_row=0 log_end=0 rebuild=1 graph=0
 
     sz=$(hui__dash_size)
     rows=${sz%% *}; cols=${sz##* }
     case "$rows" in ''|*[!0-9]*) rows=24 ;; esac
     case "$cols" in ''|*[!0-9]*) cols=80 ;; esac
     [ "$rows" -lt 12 ] && rows=12
+
+    # 构图阶段（kati+soong 分析）：没有 ninja 边，进度区换成「阶段 + 已用时间」
+    case "${HUI__PHASE_MODE:-build}" in graph) graph=1 ;; esac
 
     # 进度值这一帧稍后从日志里取；先沿用上一帧的，给右上产品信息用
     prog=${HUI__PROG_LINE:-}
@@ -2195,7 +2299,14 @@ hui__dash_draw() {
         [ "$recent_h" -gt 18 ] && recent_h=18
         [ "$recent_h" -lt 3 ] && recent_h=3
         HUI__RECENT_ON=1
-        [ "$rebuild" = "1" ] && hui__dash_recent "$log" "$recent_h" "$rw"
+        if [ "$rebuild" = "1" ]; then
+            # 构图阶段 .ninja_log 还是上一次构建的：右边改刷日志尾部，别显示陈旧动作
+            if [ "$graph" = "1" ]; then
+                hui__graph_recent "$log" "$recent_h" "$rw"
+            else
+                hui__dash_recent "$log" "$recent_h" "$rw"
+            fi
+        fi
         rh2=$(( recent_h + 1 ))
     fi
 
@@ -2229,6 +2340,28 @@ hui__dash_draw() {
     fi
     # 编译进度条全程蓝色（不随百分比变色）
     HUI__PROG_COLOR=${HUI__THEME_ACCENT:-$hui__c_blu}
+    acc=$HUI__PROG_COLOR
+
+    # 构图模式：没有 [n/m] 可数，硬画百分比只会停在 0%/100% 像卡死。
+    # 进度行改成「阶段 + 已用时间 + 转圈」，细节让下面的「最新输出」区刷。
+    if [ "$graph" = "1" ]; then
+        if [ $(( tick % 3 )) -eq 0 ] || [ -z "${HUI__GRAPH_STAGE:-}" ]; then
+            HUI__GRAPH_STAGE=$(hui__graph_stage)
+        fi
+        local gel gsp
+        gel=$(( $(date +%s) - ${HUI__PHASE_START:-$(date +%s)} ))
+        [ "$gel" -lt 0 ] && gel=0
+        case $(( tick % 10 )) in
+            0) gsp='⠋' ;; 1) gsp='⠙' ;; 2) gsp='⠹' ;; 3) gsp='⠸' ;; 4) gsp='⠼' ;;
+            5) gsp='⠴' ;; 6) gsp='⠦' ;; 7) gsp='⠧' ;; 8) gsp='⠇' ;; *) gsp='⠏' ;;
+        esac
+        prog=$(printf '%s 构图 · %s · 已用 %02d:%02d:%02d' \
+            "$gsp" "${HUI__GRAPH_STAGE:-分析中}" $((gel / 3600)) $((gel % 3600 / 60)) $((gel % 60)))
+        HUI__PROG_COUNTS=""
+        HUI__PROG_CMD=""
+        HUI__PROG_PCT=""
+        pct=""
+    fi
 
     : >| "$HUI__DASH_FRAME" 2>/dev/null
     # 注意：exec 的重定向会永久作用于当前 shell —— 千万不能在这里顺手写 2>/dev/null，
@@ -2556,8 +2689,44 @@ hui__reap_build_tree() {
     return 0
 }
 
+# 阶段日志路径：<OUT_DIR>/hui/<codename>/hui-build-<产品>-<时间>.log
+# 面板和非面板路径共用。目录建不出来时退到 OUT_DIR 根下；返回的路径仍可能
+# 写不进去，调用方负责 `: >|` 失败后再回退 mktemp。
+hui__log_file_new() {
+    local out=${OUT_DIR:-out} dev=${HUI__DEV:-${HUI__PRODUCT##*_}} d
+    [ -n "$dev" ] || dev=unknown
+    case "$out" in
+        /*) d="$out/hui/$dev" ;;
+        *)  d="$HUI_TOP/$out/hui/$dev" ;;
+    esac
+    mkdir -p "$d" 2>/dev/null || {
+        case "$out" in
+            /*) d="$out" ;;
+            *)  d="$HUI_TOP/$out" ;;
+        esac
+        mkdir -p "$d" 2>/dev/null
+    }
+    # 同一秒内起两个阶段（例如快速失败后重试）时别互相覆盖：重名就加 -2/-3
+    local base f n=2
+    base="$d/hui-build-${HUI__PRODUCT:-unknown}-$(date '+%Y%m%d-%H%M%S')"
+    f="$base.log"
+    while [ -e "$f" ]; do f="$base-$n.log"; n=$((n + 1)); done
+    printf '%s' "$f"
+}
+
+# 记住最近一次阶段日志，给 hui__looks_like_oom / 失败复盘用
+# （面板路径在子 shell 里跑，HUI__LOG_FILE 传不回来，只能落盘）。
+hui__last_log_mark() {
+    local log=$1 st
+    st="${HUI_STATE:-$HUI_TOP/.hui}/.last-phase-log"
+    mkdir -p "${st%/*}" 2>/dev/null
+    printf '%s\n' "$log" >| "$st" 2>/dev/null
+    return 0
+}
+
 hui__run_phase_dashboard() {
     local label=$1 jobs=$2; shift 2
+    local mode=${HUI__PHASE_MODE:-build}
     (
         [ -n "${HUI_TOP:-}" ] || HUI_TOP=.
         [ -n "${HUI_STATE:-}" ] || HUI_STATE="$HUI_TOP/.hui"
@@ -2568,19 +2737,15 @@ hui__run_phase_dashboard() {
             exec 2>/dev/tty
         fi
 
-        # 日志按 codename 归档：out/hui/<codename>/hui-build-<产品>-<时间>.log
-        local dev=${HUI__DEV:-${HUI__PRODUCT##*_}}
-        [ -n "$dev" ] || dev=unknown
-        local logdir="$HUI_TOP/out/hui/$dev"
-        mkdir -p "$logdir" 2>/dev/null || { mkdir -p "$HUI_TOP/out" 2>/dev/null; logdir="$HUI_TOP/out"; }
-
+        # 日志按 codename 归档：<OUT_DIR>/hui/<codename>/hui-build-<产品>-<时间>.log
         HUI__BUILD_START=$(date '+%Y-%m-%d %H:%M:%S')
         HUI__PHASE_LABEL=$label
         HUI__TARGET=${HUI__TARGET:-${*}}
-        local log="$logdir/hui-build-${HUI__PRODUCT:-unknown}-$(date '+%Y%m%d-%H%M%S').log"
+        local log; log=$(hui__log_file_new)
         : >| "$log" 2>/dev/null || log=$(mktemp "${TMPDIR:-/tmp}/hui-build.XXXXXX")
         HUI__LOG_FILE=$log
         HUI__LOG_SHORT=${log#$HUI_TOP/}
+        hui__last_log_mark "$log"
         local phase_exec; phase_exec=$(hui__executor)
         hui__highmem_refresh "$jobs"
         HUI__JOBS_MAX=$jobs
@@ -2655,7 +2820,10 @@ hui__run_phase_dashboard() {
         trap '_hui_dash_restore' EXIT
         printf '\033[?1049h\033[?25l\033[2J\033[H' >&2
 
-        hui__runa_like "$phase_exec" || hui__ctrl_start
+        # 构图阶段没有执行器在跑，也没有可调的并发：起调速控制器只会写出没人读的文件
+        if [ "$mode" != "graph" ]; then
+            hui__runa_like "$phase_exec" || hui__ctrl_start
+        fi
         hui__dash_loop "$label" "$jobs" "$log" &
         local dash=$!
 
@@ -2665,7 +2833,13 @@ hui__run_phase_dashboard() {
           export CCACHE_DIRECT="${CCACHE_DIRECT:-${HUI_CCACHE_DIRECT:-1}}"
           # 满核构建但不抢前台：CPU/IO 优先级只降这个子 shell 这一支
           hui__lower_priority
-          hui__m_run "$jobs" "$@" ) >| "$log" 2>&1 &
+          # 构图：只让 m 做 kati+soong 分析、写出三份图，不进编译。
+          # 走和编译阶段同一套面板/日志/中断清理，只是面板切到「构图模式」。
+          if [ "$mode" = "graph" ]; then
+              m -j"$jobs" --skip-ninja "$@"
+          else
+              hui__m_run "$jobs" "$@"
+          fi ) >| "$log" 2>&1 &
         build_pid=$!
         wait "$build_pid"
         local rc=$?
@@ -2700,15 +2874,15 @@ EOF
             mv -f "$(hui__perf_file).tmp" "$(hui__perf_file)" 2>/dev/null
         fi
         rm -f "${HUI__PSI_LOG:-}" 2>/dev/null
-        if [ $rc -eq 0 ]; then
-            printf '\n%s✓%s %s 完成 · 用时 %02d:%02d:%02d · 日志 %s\n' \
-                "$hui__c_grn" "$hui__c_rst" "$label" \
-                $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) "$HUI__LOG_SHORT" >&2
-        else
+        if [ $rc -ne 0 ]; then
             printf '\n%s✗%s %s 失败 rc=%s · 用时 %02d:%02d:%02d\n' \
                 "$hui__c_red" "$hui__c_rst" "$label" "$rc" \
                 $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) >&2
             hui__fail_report "$log"
+        elif [ "${HUI__PHASE_QUIET_OK:-0}" != "1" ]; then
+            printf '\n%s✓%s %s 完成 · 用时 %02d:%02d:%02d · 日志 %s\n' \
+                "$hui__c_grn" "$hui__c_rst" "$label" \
+                $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) "$HUI__LOG_SHORT" >&2
         fi
         exit $rc
     )
@@ -2727,10 +2901,15 @@ hui__phase_banner() {
             printf '%s│%s 内核   预编译\n' "$hui__c_dim" "$hui__c_rst"
         fi
         printf '%s│%s 阶段   %s → %s\n' "$hui__c_dim" "$hui__c_rst" "$label" "$*"
-        local minj; minj=$(hui__jobs_min)
-        [ "$minj" -gt "$jobs" ] && minj=$jobs
-        printf '%s│%s 并发   上限 %s（%s~%s，压力高时自动收）\n' "$hui__c_dim" "$hui__c_rst" \
-            "$jobs" "$minj" "$jobs"
+        if [ "${HUI__PHASE_MODE:-build}" = "graph" ]; then
+            printf '%s│%s 并发   分析阶段：soong bootstrap 走 -j%s，kati/soong 串行\n' \
+                "$hui__c_dim" "$hui__c_rst" "$jobs"
+        else
+            local minj; minj=$(hui__jobs_min)
+            [ "$minj" -gt "$jobs" ] && minj=$jobs
+            printf '%s│%s 并发   上限 %s（%s~%s，压力高时自动收）\n' "$hui__c_dim" "$hui__c_rst" \
+                "$jobs" "$minj" "$jobs"
+        fi
         printf '%s└%s 开始   %s\n\n' "$hui__c_dim" "$hui__c_rst" "$(date '+%H:%M:%S')"
     } >&2
 }
@@ -2758,6 +2937,12 @@ hui__panel_loop() {
         [ "$tgt" = "-" ] && tgt=${HUI__JOBS_MAX:--}
         local t=$(( $(date +%s) - start ))
         hui__mem_sample
+        if [ "${HUI__PHASE_MODE:-build}" = "graph" ]; then
+            printf '%s[hui]%s %02d:%02d:%02d · 构图（kati+soong 分析，无编译进度）· %s\n' \
+                "$hui__c_dim" "$hui__c_rst" \
+                $((t / 3600)) $((t % 3600 / 60)) $((t % 60)) "$(hui__panel_line)" >&2
+            continue
+        fi
         printf '%s[hui]%s %02d:%02d:%02d · 并发 %s/%s · %s\n' \
             "$hui__c_dim" "$hui__c_rst" \
             $((t / 3600)) $((t % 3600 / 60)) $((t % 60)) \
@@ -2941,6 +3126,13 @@ def main():
             else:
                 got = []
             if got != mat:
+                # out/ 下的字面路径是构建自己的产物。典型：BOARD_PREBUILT_DTBOIMAGE
+                # 指向 obj/DTBO_OBJ/.../dtbo.img —— 图生成时还没编内核（产物不存在），
+                # 之后内核阶段才落盘。这种「产物新出现」不该让整张图作废：执行器按旧图
+                # 照样会把它编出来。只有产物「消失」才可能让图里引用的 prebuilt 悬空，
+                # 那种仍然判失效。
+                if (pat == OUT or pat.startswith(OUT + "/")) and not mat and got:
+                    continue
                 stale("文件出现/消失: " + pat)
 
     # soong 编译环境：只比用户显式设置过的变量，避免把 soong_ui 算出来的默认值当变化
@@ -3000,18 +3192,26 @@ def main():
     if hit:
         stale("构建定义比图新: " + hit)
 
-    # 构建系统自身源码变了，图也可能过时
-    roots = [TOP + "/build/soong", TOP + "/build/blueprint", TOP + "/build/make"]
-    roots = [r for r in roots if os.path.isdir(r)]
-    try:
-        hit = subprocess.run(
-            ["find"] + roots + ["-type", "f", "-newer", p(kati), "-print", "-quit"],
-            capture_output=True, text=True, timeout=60,
-        ).stdout.strip()
-    except Exception as e:
-        stale("构建工具扫描失败: %s" % e)
-    if hit:
-        stale("构建工具源码变了: " + hit)
+    # 构建系统自身源码变了，图也可能过时。
+    # 只看真正参与分析的代码：build/soong、build/blueprint 的 Go 源码
+    # （编译进 soong_build）；build/make 里排除 tools/、scripts/ —— 那些是
+    # 构建期脚本（gen_build_prop.py、releasetools 之类），改它们不影响 ninja 图，
+    # 以前用 `-newer kati` 全扫会把这类改动误判成「构建工具源码变了」。
+    # build/make 的 .mk / 全树的 Android.bp 已经由上面的扫描覆盖。
+    scans = [
+        ["find", TOP + "/build/soong", TOP + "/build/blueprint",
+         "-type", "f", "-name", "*.go", "-newer", p(kati), "-print", "-quit"],
+        ["find", TOP + "/build/make",
+         "-path", "*/tools", "-prune", "-o", "-path", "*/scripts", "-prune", "-o",
+         "-type", "f", "-newer", p(kati), "-print", "-quit"],
+    ]
+    for cmd in scans:
+        try:
+            hit = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout.strip()
+        except Exception as e:
+            stale("构建工具扫描失败: %s" % e)
+        if hit:
+            stale("构建工具源码变了: " + hit)
 
     # 图里的产品/变体/OUT_DIR 必须和这次 lunch 一致
     cmd = ("exec '%s' --dump_stamp_tool --env '%s' | "
@@ -3109,6 +3309,8 @@ hui__siso_run() {
     (
         export NINJA_HIGHMEM_NUM_JOBS="${NINJA_HIGHMEM_NUM_JOBS:-${HUI_HIGHMEM_JOBS:-3}}"
         export CCACHE_DIRECT="${CCACHE_DIRECT:-${HUI_CCACHE_DIRECT:-1}}"
+        # 同 hui__runa_run：直连执行器要自己补 OUT_DIR，soong_ui 才会设。
+        export OUT_DIR="${out%/}"
         export SISO_EXPERIMENTS="${SISO_EXPERIMENTS:-ignore-missing-out-in-depfile,allow-unexpected-rsp-remove,oom-score-adj}"
         export TMPDIR="$HUI_TOP/$out/soong/.temp"
         mkdir -p "$TMPDIR" 2>/dev/null
@@ -3172,6 +3374,9 @@ hui__runa_run() {
     (
         export NINJA_HIGHMEM_NUM_JOBS="${NINJA_HIGHMEM_NUM_JOBS:-${HUI_HIGHMEM_JOBS:-3}}"
         export CCACHE_DIRECT="${CCACHE_DIRECT:-${HUI_CCACHE_DIRECT:-1}}"
+        # soong_ui 会给动作环境补 OUT_DIR；直连执行器绕过了它，得自己补，
+        # 否则 gen_build_prop.py 会 startswith(None) 崩掉（odm-build.prop 失败）。
+        export OUT_DIR="${out%/}"
         hui__pools_export "$jobs"
         export TMPDIR="$HUI_TOP/$out/soong/.temp"
         mkdir -p "$TMPDIR" 2>/dev/null
@@ -3298,14 +3503,131 @@ hui__run_kernel_phase() {
     fi
     rc=$?
     if [ "$rc" -eq 0 ]; then
-        hui__kdone_write "$po" || hui__warn "内核完成但写完成标记失败，hui save 会拒绝保存"
+        # 整理 mtime + 写完成标记（标记里记的是 Image 的 mtime）
+        hui__kernel_tidy "$po" || hui__warn "内核完成但写完成标记失败，hui save 会拒绝保存"
     fi
     return "$rc"
+}
+
+# 内核产物的 mtime 整理（只动 mtime，不动内容）。
+# Lineage 的 kernel.mk 依赖链：
+#   $(KERNEL_CONFIG): $(KERNEL_OUT) $(ALL_KERNEL_DEFCONFIG_SRCS)
+#   $(TARGET_PREBUILT_INT_KERNEL): $(KERNEL_CONFIG) ... $(KERNEL_MODULES_PARTITION_FILE_LIST)
+# 而内核构建自己会在 Image 之后继续改这些输入（Kbuild 收尾重写 .config、
+# 拷贝/打包规则重写 file_list）。内核阶段一结束，紧随其后的第二次 m（ROM 阶段）
+# 就会认为 config/Image 都过期，重跑 config + full-LTO 链接，和 ROM 编译并发
+# 抢内存 —— 实测被 OOM kill（make: Error 137，ld.lld 45G VM）。
+# 这里按依赖顺序把内核产物 mtime 抬到当前，第二次 m 就会认定内核已是最新。
+hui__kernel_freshen() {
+    local po=${1:-$(hui__prodout "$HUI__PRODUCT")} ka d f
+    [ -n "${HUI__KS:-}" ] || return 0
+    [ -d "$po/obj" ] || return 0
+    ka=${HUI__KA:-arm64}
+    for d in "$po/obj/KERNEL_OBJ" "$po/obj/DTBO_OBJ" "$po/obj/DTB_OBJ"; do
+        [ -d "$d" ] || continue
+        # 先 config：它的输入是 KERNEL_OUT 目录本身，目录 mtime 会比 config 新
+        [ -f "$d/.config" ] && touch -- "$d/.config" 2>/dev/null
+        # 再镜像：config 和 file_list 都是它的输入
+        [ -d "$d/arch/$ka/boot" ] || continue
+        while IFS= read -r f; do
+            [ -n "$f" ] && touch -- "$f" 2>/dev/null
+        done <<EOF
+$(find "$d/arch/$ka/boot" -maxdepth 1 -type f 2>/dev/null)
+EOF
+    done
+    # 最后是 $po 下的安装拷贝（它们依赖上面的镜像）
+    for f in "$po/kernel" "$po/dtbo.img" "$po/dtb.img"; do
+        [ -e "$f" ] && touch -- "$f" 2>/dev/null
+    done
+    return 0
+}
+
+# ninja 判定「输出过期」有两条规则（src/graph.cc RecomputeOutputDirty）：
+#   1) 输出 mtime 比最近输入旧；
+#   2) .ninja_log 里记录的该输出时间（entry->mtime）比最近输入旧 —— 即使
+#      磁盘上的输出已经被 touch 新了，只要 log 里还是旧时间，照样判 dirty。
+# 内核阶段刚编完，Kernel.mk 的收尾还会写新 .config / file_list，所以 ROM 阶段
+# 第二次 m 会重编内核。这里只把 **内核产物** 对应的 log 记录时间改成当前
+# （其它条目不动）：之后内核源码再变，输入 mtime 超过当前时间，照样会触发重编。
+hui__ninja_log_restat_kernel() {
+    local po=${1:-$(hui__prodout "$HUI__PRODUCT")}
+    local log; log=$(hui__ninja_log)
+    [ -s "$log" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local now top dev
+    now=$(date +%s%N)
+    top=${HUI_TOP:-.}
+    dev=${po##*/}
+    python3 - "$top" "$log" "$now" "${OUT_DIR:-out}" "$dev" <<'PY' || return 0
+import os, sys
+TOP, LOG, NOW, OUT, DEV = sys.argv[1:6]
+prod = os.path.join(TOP, OUT, "target/product", DEV)
+prefixes = [
+    os.path.join(prod, "obj/KERNEL_OBJ"),
+    os.path.join(prod, "obj/DTBO_OBJ"),
+    os.path.join(prod, "obj/DTB_OBJ"),
+    os.path.join(prod, "kernel"),
+    os.path.join(prod, "dtbo.img"),
+    os.path.join(prod, "dtb.img"),
+]
+def hit(p):
+    a = p if p.startswith("/") else os.path.join(TOP, p)
+    return any(a == x or a.startswith(x + "/") for x in prefixes)
+tmp = LOG + ".restat"
+with open(LOG, "r", encoding="utf-8", errors="surrogateescape") as f, \
+     open(tmp, "w", encoding="utf-8", errors="surrogateescape") as o:
+    for line in f:
+        if line.startswith("#"):
+            o.write(line)
+            continue
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 5 and hit(parts[3]):
+            parts[2] = NOW
+            line = "\t".join(parts) + "\n"
+        o.write(line)
+os.replace(tmp, LOG)
+PY
+    return 0
+}
+
+# 整理内核 mtime + 写完成标记（标记里记了 Image 的 mtime，touch 之后必须重写，
+# 否则 hui__kernel_ready 会把内核判成半成品）。
+hui__kernel_tidy() {
+    local po=${1:-$(hui__prodout "$HUI__PRODUCT")}
+    # 注意：不能写成 local ko=... cfg="$ko/..." —— 同一个 local 里后面的赋值
+    # 读不到前面刚声明的变量（set -u 下直接报 unbound，没开 -u 时静默变成
+    # "/.config"，导致下面 stat 失败、目录 mtime 回退被跳过）。
+    local ko cfg ct
+    ko="$po/obj/KERNEL_OBJ"
+    cfg="$ko/.config"
+    hui__kernel_freshen "$po"
+    hui__kdone_write "$po" || return 1
+    # 完成标记就在 KERNEL_OBJ 里：写它会把该目录的 mtime 顶新，而 config 规则
+    # 依赖这个目录，ROM 阶段又会判 config 过期。最后把目录 mtime 压回 .config 之前
+    # （只动目录元数据，不碰文件内容）。
+    ct=$(stat -c %Y -- "$cfg" 2>/dev/null)
+    case "$ct" in
+        ''|*[!0-9]*) : ;;
+        *) touch -d "@$(( ct - 60 ))" -- "$ko" 2>/dev/null ;;
+    esac
+    # 文件 mtime 理顺还不够：ninja 还会拿 .ninja_log 里的记录时间跟输入比
+    hui__ninja_log_restat_kernel "$po"
+    return 0
+}
+
+# 进 ROM 阶段（第二次 m）前调用：内核已就绪时理顺 mtime 并重写完成标记。
+hui__kernel_settle() {
+    local po=${1:-$(hui__prodout "$HUI__PRODUCT")}
+    [ -n "${HUI__KS:-}" ] || return 0
+    hui__kernel_ready "$po" || return 0
+    hui__kernel_tidy "$po" || hui__warn "重写内核完成标记失败"
+    return 0
 }
 
 # 跑一个 m 阶段：-j 给的是天花板，实际并发由控制器连续调节
 hui__run_phase() {
     local label=$1 jobs=$2; shift 2
+    local mode=${HUI__PHASE_MODE:-build}
     if hui__dash_available; then
         hui__run_phase_dashboard "$label" "$jobs" "$@"
         return $?
@@ -3318,9 +3640,20 @@ hui__run_phase() {
     HUI__PHASE_START=$(date +%s)
     HUI__STAT_FILE=$(mktemp "${TMPDIR:-/tmp}/hui-stat.XXXXXX" 2>/dev/null)
 
+    # 没面板也留一份阶段日志（和面板同一位置），失败时 hui__fail_report 用得上
+    local log; log=$(hui__log_file_new)
+    : >| "$log" 2>/dev/null || log=$(mktemp "${TMPDIR:-/tmp}/hui-build.XXXXXX")
+    HUI__LOG_FILE=$log
+    HUI__LOG_SHORT=${log#$HUI_TOP/}
+    hui__last_log_mark "$log"
+    hui__dim "  日志 ${HUI__LOG_SHORT}" >&2
+
     hui__phase_banner "$label" "$jobs" "$@"
 
-    hui__runa_like "$phase_exec" || hui__ctrl_start
+    # 构图阶段没有执行器在读并发文件，控制器起来只会空转
+    if [ "$mode" != "graph" ]; then
+        hui__runa_like "$phase_exec" || hui__ctrl_start
+    fi
     if [ "${HUI_PANEL:-1}" != "0" ]; then
         hui__panel_loop &
         HUI__PANEL_PID=$!
@@ -3341,14 +3674,31 @@ hui__run_phase() {
         return 0
     }
     trap '_hui_phase_int' INT HUP TERM
+    # 输出直接写日志（进程退出即写完，不会和后面的 fail_report 抢），
+    # 终端这边用 tail 实时跟随，保持和以前直接跑 m 一样的可见性。
     ( export NINJA_HIGHMEM_NUM_JOBS="${NINJA_HIGHMEM_NUM_JOBS:-$HUI_HIGHMEM_JOBS}"
       export CCACHE_DIRECT="${CCACHE_DIRECT:-${HUI_CCACHE_DIRECT:-1}}"
       hui__lower_priority
-      hui__m_run "$jobs" "$@" ) &
+      if [ "$mode" = "graph" ]; then
+          m -j"$jobs" --skip-ninja "$@"
+      else
+          hui__m_run "$jobs" "$@"
+      fi ) >| "$log" 2>&1 &
     build_pid=$!
+    local tail_pid=""
+    if command -v tail >/dev/null 2>&1; then
+        # 跟到 stdout，保持「重定向 stdout 能拿到构建输出」的老行为
+        tail -n +1 -f --pid="$build_pid" --sleep-interval=0.2 "$log" 2>/dev/null &
+        tail_pid=$!
+    fi
     wait "$build_pid"
     local rc=$?
     build_pid=""
+    if [ -n "$tail_pid" ]; then
+        sleep 0.05
+        kill -TERM "$tail_pid" 2>/dev/null
+        wait "$tail_pid" 2>/dev/null
+    fi
     trap - INT HUP TERM
     [ "${HUI__ABORTED:-0}" = "1" ] && rc=130
 
@@ -3367,25 +3717,42 @@ hui__run_phase() {
         rm -f "$HUI__STAT_FILE"
     fi
     HUI__STAT_FILE=""
-    if [ $rc -eq 0 ]; then
-        printf '%s[hui]%s 阶段「%s」完成 · 用时 %02d:%02d:%02d · 末次并发 %s/%s\n' \
-            "$hui__c_grn" "$hui__c_rst" "$label" \
-            $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) "${tgt:--}" "$jobs" >&2
-    else
-        printf '%s[hui]%s 阶段「%s」失败 rc=%s · 用时 %02d:%02d:%02d\n' \
-            "$hui__c_red" "$hui__c_rst" "$label" "$rc" \
-            $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) >&2
+    if [ $rc -ne 0 ]; then
+        # 130 = Ctrl-C：中断提示由 trap 打过，不再当“失败”刷一遍+复盘
+        if [ "$rc" -ne 130 ]; then
+            printf '%s[hui]%s 阶段「%s」失败 rc=%s · 用时 %02d:%02d:%02d\n' \
+                "$hui__c_red" "$hui__c_rst" "$label" "$rc" \
+                $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) >&2
+            hui__fail_report "$log"
+        fi
+    elif [ "${HUI__PHASE_QUIET_OK:-0}" != "1" ]; then
+        if [ "$mode" = "graph" ]; then
+            printf '%s[hui]%s 构图「%s」完成 · 用时 %02d:%02d:%02d\n' \
+                "$hui__c_grn" "$hui__c_rst" "$label" \
+                $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) >&2
+        else
+            printf '%s[hui]%s 阶段「%s」完成 · 用时 %02d:%02d:%02d · 末次并发 %s/%s · 日志 %s\n' \
+                "$hui__c_grn" "$hui__c_rst" "$label" \
+                $((el / 3600)) $((el % 3600 / 60)) $((el % 60)) "${tgt:--}" "$jobs" \
+                "${HUI__LOG_SHORT:-?}" >&2
+        fi
     fi
     return $rc
 }
 
 # 失败如果像是内存打爆的，自动降一档重试一次
 hui__looks_like_oom() {
+    local st="${HUI_STATE:-$HUI_TOP/.hui}/.last-phase-log" f
     {
-        tail -c 300000 "$HUI_TOP/out/soong.log" 2>/dev/null
-        tail -c 300000 "$HUI_TOP/out/siso_output" 2>/dev/null
-        [ -n "${HUI__LOG_FILE:-}" ] && tail -c 300000 "$HUI__LOG_FILE" 2>/dev/null
-    } | grep -qiE 'signal: killed|out of memory|oom-kill'
+        tail -c 300000 "$HUI_TOP/${OUT_DIR:-out}/soong.log" 2>/dev/null
+        tail -c 300000 "$HUI_TOP/${OUT_DIR:-out}/siso_output" 2>/dev/null
+        [ -n "${HUI__LOG_FILE:-}" ] && tail -c 400000 "$HUI__LOG_FILE" 2>/dev/null
+        # 面板路径的日志在子 shell 里，靠落盘的标记找到
+        if [ -f "$st" ]; then
+            f=$(cat "$st" 2>/dev/null)
+            [ -n "$f" ] && [ "$f" != "${HUI__LOG_FILE:-}" ] && tail -c 400000 "$f" 2>/dev/null
+        fi
+    } | grep -qiE 'signal: killed|out of memory|oom-kill|killed process|已杀死|error 137|(^|[^[:alnum:]_])killed([^[:alnum:]_]|$)'
 }
 
 hui__run_phase_retry() {
@@ -3397,11 +3764,37 @@ hui__run_phase_retry() {
     if [ $rc -ne 0 ] && [ "$jobs" -gt "$minj" ] && hui__looks_like_oom; then
         local j2=$(( jobs - 3 ))
         [ "$j2" -lt "$minj" ] && j2=$minj
-        hui__warn "看着像内存被打爆（日志里有 killed），自动降到 -j$j2 重试一次"
+        hui__warn "看着像内存被打爆（日志里有 Error 137 / killed / 已杀死），自动降到 -j$j2 重试一次"
         hui__run_phase "$label 重试" "$j2" "$@"
         rc=$?
     fi
     return $rc
+}
+
+# 把「只生成构建图」当成一个正经阶段跑：kati+soong 那十几分钟照样有面板、
+# 有日志、有 Ctrl-C 清理，而不是一次黑盒的前台 m。
+# 返回 0 = 图已可复用（顺带设 HUI__M_FAST=1）；1 = 没生成出来，调用方回退完整 m；
+#      130 = 被 Ctrl-C 打断。
+hui__graph_first() {
+    local jobs=$1; shift
+    local prev_mode=${HUI__PHASE_MODE:-}
+    hui__say "先生成构建图：m --skip-ninja（kati+soong 分析，不编译；这棵树 10~15 分钟）…"
+    HUI__PHASE_MODE=graph
+    hui__run_phase "构建图" "$jobs" "$@"
+    local rc=$?
+    if [ -n "$prev_mode" ]; then HUI__PHASE_MODE=$prev_mode; else unset HUI__PHASE_MODE; fi
+    [ "$rc" -eq 130 ] && return 130
+    if [ "$rc" -ne 0 ]; then
+        hui__warn "m --skip-ninja 失败（rc=$rc），回退完整 m"
+        return 1
+    fi
+    if hui__graph_verify; then
+        HUI__M_FAST=1
+        hui__ok "构建图已生成 → 交给 $(hui__executor) 编，跳过第二次分析"
+        return 0
+    fi
+    hui__warn "图生成后校验仍未通过（${HUI__GRAPH_WHY:-未知}），回退完整 m"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -3599,7 +3992,7 @@ hui__main() {
         fi
         variant=${variant:-user}
     fi
-    hui__say "产品 $product，变体 $variant"
+    hui__say "构建 $product / $variant"
 
     if [ -z "${ANDROID_BUILD_TOP:-}" ] || ! command -v m >/dev/null 2>&1; then
         hui__say "加载 build/envsetup.sh"
@@ -3628,62 +4021,134 @@ hui__rom_full_name() {
     return 1
 }
 
+# 时长：<1h 用 m:ss，>=1h 用 h:mm
+hui__fmt_dur() {
+    local s=${1:-0}
+    case "$s" in ''|*[!0-9]*) s=0 ;; esac
+    if [ "$s" -ge 3600 ]; then
+        printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+    else
+        printf '%dm%02ds' $((s / 60)) $((s % 60))
+    fi
+}
+
+# 构建收尾摘要：一行标题 + 阶段 / 缓存 / 日志，替代原来散落的
+# 「✓ 构建成功，用时…」+「构建图完成 · 内核完成 · ROM完成」+ 缓存提示。
+hui__build_summary() {
+    local rc=$1 total=$2 rom_s=$3
+    local line log state mark
+    line=$(printf '─%.0s' $(seq 1 64))
+    log=$(cat "${HUI_STATE:-$HUI_TOP/.hui}/.last-phase-log" 2>/dev/null)
+    [ -n "$log" ] || log=${HUI__LOG_FILE:-}
+    [ -n "$log" ] && log=${log#$HUI_TOP/}
+    printf '\n%s%s%s\n' "$hui__c_dim" "$line" "$hui__c_rst" >&2
+    if [ "$rc" -eq 0 ]; then
+        mark="${hui__c_grn}✓${hui__c_rst}"
+        printf '%s[hui]%s %s 构建成功 · 总用时 %dh%02dm · ROM %s\n' \
+            "$hui__c_dim" "$hui__c_rst" "$mark" \
+            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+    elif [ "$rc" -eq 130 ]; then
+        mark="${hui__c_yel}■${hui__c_rst}"
+        printf '%s[hui]%s %s 构建已中断 · 总用时 %dh%02dm · ROM %s\n' \
+            "$hui__c_dim" "$hui__c_rst" "$mark" \
+            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+    else
+        mark="${hui__c_red}✗${hui__c_rst}"
+        printf '%s[hui]%s %s 构建失败 rc=%s · 总用时 %dh%02dm · ROM %s\n' \
+            "$hui__c_dim" "$hui__c_rst" "$mark" "$rc" \
+            $((total / 3600)) $((total % 3600 / 60)) "$(hui__fmt_dur "$rom_s")" >&2
+    fi
+    state="构建图 ${HUI__GRAPH_STATE:-?} · 内核 ${HUI__KERNEL_STATE:-?}"
+    printf '%s[hui]%s   阶段  %s\n' "$hui__c_dim" "$hui__c_rst" "$state" >&2
+    state=""
+    case "${HUI__SAVE_STATE:-}" in
+        skip)     state="内核快照已是最新${HUI__SAVE_FP:+（${HUI__SAVE_FP}）}" ;;
+        saved)    state="内核快照已保存${HUI__SAVE_FP:+（${HUI__SAVE_FP}）}" ;;
+        fail)     state="内核快照保存失败" ;;
+        prebuilt) state="预编译内核，无需快照" ;;
+    esac
+    [ "$rc" -eq 0 ] && [ -n "$state" ] && \
+        printf '%s[hui]%s   缓存  %s\n' "$hui__c_dim" "$hui__c_rst" "$state" >&2
+    [ -n "$log" ] && printf '%s[hui]%s   日志  %s\n' "$hui__c_dim" "$hui__c_rst" "$log" >&2
+    printf '%s%s%s\n' "$hui__c_dim" "$line" "$hui__c_rst" >&2
+    return 0
+}
+
 hui__cmd_build() {
     hui__require_env || return 1
     hui__build_lock || return 1
+    # 计时从拿到锁开始：构图/恢复/内核/ROM 都算进摘要里的「总用时」
+    local hui__t0; hui__t0=$(date +%s)
+    HUI__GRAPH_STATE=""
+    HUI__KERNEL_STATE=""
+    HUI__SAVE_STATE=""
+    HUI__SAVE_FP=""
     hui__kernel_vars || return 1
+    [ -n "${HUI__KS:-}" ] || HUI__KERNEL_STATE="预编译"
     # ROM 全名（面板产品信息用）：Lineage/EVO/crDroid 等常见变量依次试；空则回退产品名
     if [ -z "${HUI__ROM_NAME:-}" ]; then
         HUI__ROM_NAME=$(hui__rom_full_name)
         [ -n "$HUI__ROM_NAME" ] || HUI__ROM_NAME="${HUI__PRODUCT:-?}-${TARGET_BUILD_VARIANT:-?}"
     fi
-    # GMS 开关（面板配置表用）
-    [ -n "${HUI__WITH_GMS:-}" ] || HUI__WITH_GMS=$(get_build_var WITH_GMS 2>/dev/null)
+    # 面板配置表要的 PLATFORM / BUILD_ID / PATCH / GMS：构图时 build.prop 还没生成，
+    # 先在构建前取一次 build var，别让面板显示「?」
+    hui__panel_config
     local jobs; jobs=$(hui__jobs_start)
     hui__highmem_refresh "$jobs"
-    hui__say "并发 -j$jobs（内存准入；硬上限 $(hui__jobs_max)）· 高内存任务 $HUI_HIGHMEM_JOBS 路 · 运行中 $(hui__jobs_min)~$jobs"
+    hui__say "并发 -j$jobs（上限 $(hui__jobs_max) · 运行中 $(hui__jobs_min)~$jobs）· 高内存 $HUI_HIGHMEM_JOBS 路"
     hui__pools_export "$jobs"
     local pool_line; pool_line=$(hui__pools_summary)
-    [ -n "$pool_line" ] && hui__say "内存池${pool_line}（按任务类型限流）"
+    [ -n "$pool_line" ] && hui__say "内存池${pool_line}"
     hui__mem_headsup
 
+    # 账本格式预警：不同 ninja 版本的 .ninja_log/.ninja_deps 不通用，
+    # 切换执行器会让 ninja 丢掉账本、把整棵树当脏（实测一次 22 万条边全量重建）。
+    hui__ninja_log_guard
+
+    # 先恢复内核快照，再校验/生成构建图：
+    # restore 会把 obj/KERNEL_OBJ、DTBO_OBJ、DTB_OBJ 落回 out/，而
+    # BOARD_PREBUILT_DTBOIMAGE 指向的 dtbo.img 会被 soong 记成 glob 输入。
+    # 若先构图后 restore，图里记的是「文件不存在」，下次构建就会因为 glob
+    # 结果变了又跑一遍完整分析（实测多花 9 分钟）。
+    hui__restore; local rrc=$?
+    if [ -z "${HUI__KERNEL_STATE:-}" ]; then
+        if [ "$rrc" -eq 0 ]; then
+            HUI__KERNEL_STATE="快照"
+        elif [ -n "${HUI__KS:-}" ]; then
+            HUI__KERNEL_STATE="未就绪"
+        fi
+    fi
+
     HUI__M_FAST=0
+    [ "${HUI_GRAPH_REUSE:-1}" = "0" ] && HUI__GRAPH_STATE="强制重跑"
     if [ "${HUI_GRAPH_REUSE:-1}" != "0" ]; then
         hui__say "校验构建图（约 5~10 秒）…"
         if hui__graph_verify; then
             HUI__M_FAST=1
-            hui__ok "构建图验证通过（$(hui__graph_mtime)）→ 直接复用，跳过 kati+soong"
+            HUI__GRAPH_STATE="复用（$(hui__graph_mtime)）"
+            hui__ok "构建图 复用（$(hui__graph_mtime)，跳过 kati+soong）"
         else
+            hui__GRAPH_STATE="回退完整 m"
             hui__say "构建图需要更新：$HUI__GRAPH_WHY"
             # 首次构建：只让 m 生成图（不编译），拿到图后切执行器编。
             # HUI_GRAPH_FIRST=0 恢复旧行为（一次性 m 编到底）。
             if [ "${HUI_GRAPH_FIRST:-1}" != "0" ] && hui__runa_like; then
-                hui__say "先生成构建图：m --skip-ninja（kati+soong 分析，不编译）…"
-                if m -j"$jobs" --skip-ninja "$@"; then
-                    if hui__graph_verify; then
-                        HUI__M_FAST=1
-                        hui__ok "构建图已生成 → 交给 $(hui__executor) 编，跳过第二次分析"
-                    else
-                        hui__warn "图生成后校验仍未通过（$HUI__GRAPH_WHY），回退完整 m"
-                    fi
-                else
-                    hui__warn "m --skip-ninja 失败，回退完整 m"
-                fi
+                # 构图同样走面板（kati+soong 也能看到阶段/耗时，不再是黑盒 m）
+                hui__graph_first "$jobs" "$@"
+                local grc=$?
+                [ "$grc" -eq 130 ] && return 130
+                [ "$grc" -eq 0 ] && HUI__GRAPH_STATE="已生成"
             fi
         fi
     fi
 
     [ "$HUI__M_FAST" = "1" ] && hui__phase_done "构建图完成"
 
-    # 账本格式预警：不同 ninja 版本的 .ninja_log/.ninja_deps 不通用，
-    # 切换执行器会让 ninja 丢掉账本、把整棵树当脏（实测一次 22 万条边全量重建）。
-    hui__ninja_log_guard
-
-    hui__restore; local rrc=$?
     if [ "$rrc" -eq 2 ] && [ -n "${HUI__KS:-}" ]; then
         hui__warn "内核快照缺失或不完整，先补内核（约 20~30 分钟）"
         hui__run_kernel_phase "内核" "$jobs"; rrc=$?
         [ "$rrc" -ne 0 ] && return "$rrc"
+        HUI__KERNEL_STATE="已编"
         # 内核编完立刻存快照：后面 ROM 再失败/被 Ctrl-C，内核也不用重编
         hui__ok "内核完成，存快照"
         hui__save || hui__warn "快照保存失败（内核产物在位，本次继续编 ROM）"
@@ -3700,6 +4165,7 @@ hui__cmd_build() {
         hui__run_kernel_phase "内核" "$jobs"
         rrc=$?
         [ "$rrc" -ne 0 ] && return "$rrc"
+        HUI__KERNEL_STATE="已编"
         hui__ok "内核完成，存快照"
         hui__save || hui__warn "快照保存失败（内核产物在位，本次继续编 ROM）"
     fi
@@ -3714,16 +4180,25 @@ hui__cmd_build() {
         hui__say "内存有变化：构建阶段并发 -j${build_jobs}（内核阶段是 -j${jobs}）"
         jobs=$build_jobs
     fi
-    hui__run_phase "ROM" "$jobs" "$@"
+    # 第二次 m（ROM 阶段）之前理顺内核 mtime：
+    # 否则 Lineage kernel.mk 的 config→Image 依赖会被判过期，重跑一遍 full-LTO 链接，
+    # 和 ROM 编译并发抢内存（实测被 OOM kill，make: Error 137）。
+    hui__kernel_settle "$po"
+    # 失败如果像内存打爆（Error 137 / 已杀死 / oom-kill）就降一档并发重试一次；
+    # ROM 是增量续跑，重试只会补剩下的边，不会从头编。
+    local rom_t0; rom_t0=$(date +%s)
+    HUI__PHASE_QUIET_OK=1 hui__run_phase_retry "ROM" "$jobs" "$@"
     local rc=$?
+    local rom_s=$(( $(date +%s) - rom_t0 ))
     if [ $rc -eq 130 ]; then
-        hui__warn "已中断（Ctrl-C）"
+        # 中断提示 trap/面板已经打过，这里只补一块摘要
+        hui__build_summary 130 "$(( $(date +%s) - hui__t0 ))" "$rom_s"
         return 130
     fi
     if [ $rc -eq 0 ]; then
+        local total=$(( $(date +%s) - hui__t0 ))
+        HUI__LAST_SECONDS=$total
         hui__phase_done "ROM完成"
-        hui__ok "构建成功，用时 $(printf '%dh%02dm' $((HUI__LAST_SECONDS/3600)) $((HUI__LAST_SECONDS%3600/60)))"
-        [ -n "${HUI__PHASE_STATE:-}" ] && hui__dim "  ${HUI__PHASE_STATE}"
         # 内核可能是在这次 m 里编的（没走 hui 的内核阶段）：补写完成标记，
         # 否则 hui save 会拒绝，下次构建还会误以为内核不完整。
         local po3; po3=$(hui__prodout "$HUI__PRODUCT")
@@ -3732,10 +4207,13 @@ hui__cmd_build() {
            && ! hui__kdone_ok "$po3"; then
             hui__dim "  内核是这次 m 里编的，补写完成标记"
             hui__kdone_write "$po3" || hui__warn "补写内核完成标记失败（hui save 可能被拒）"
+            HUI__KERNEL_STATE="已编"
         fi
-        hui__save
+        HUI__SAVE_QUIET=1 hui__save || \
+            hui__warn "内核快照保存失败（不影响本次构建）"
+        hui__build_summary 0 "$total" "$rom_s"
     else
-        hui__err "构建失败（rc=$rc），不更新内核缓存"
+        hui__build_summary "$rc" "$(( $(date +%s) - hui__t0 ))" "$rom_s"
     fi
     return $rc
 }
@@ -4290,12 +4768,26 @@ hui__cmd_tui() {
         1) hui__main "$(hui__device "$HUI__PRODUCT")_${TARGET_BUILD_VARIANT:-user}" ;;
         2) hui__build_lock || return 1
            HUI__M_FAST=0
-           if hui__graph_verify; then HUI__M_FAST=1; hui__ok "构建图验证通过，直接复用"; fi
+           hui__panel_config
            hui__restore
+           if hui__graph_verify; then
+               HUI__M_FAST=1; hui__ok "构建图 复用"
+           elif [ "${HUI_GRAPH_FIRST:-1}" != "0" ] && hui__runa_like; then
+               # 只编内核也要先有图：按默认目标生成（图本身与目标无关，kernel 规则也在里面）
+               hui__graph_first "$(hui__jobs_start)" "$(hui__default_target)"
+               [ $? -eq 130 ] && return 130
+           fi
            hui__run_kernel_phase "内核" "$(hui__jobs_start)" && hui__save ;;
         3) hui__build_lock || return 1
            HUI__M_FAST=0
-           if hui__graph_verify; then HUI__M_FAST=1; hui__ok "构建图验证通过，直接复用"; fi
+           hui__panel_config
+           if hui__graph_verify; then
+               HUI__M_FAST=1; hui__ok "构建图 复用"
+           elif [ "${HUI_GRAPH_FIRST:-1}" != "0" ] && hui__runa_like; then
+               hui__graph_first "$(hui__jobs_start)" "$(hui__default_target)"
+               [ $? -eq 130 ] && return 130
+           fi
+           hui__kernel_settle "$(hui__prodout "$HUI__PRODUCT")"
            hui__run_phase_retry "ROM" "$(hui__jobs_start)" "$(hui__default_target)" ;;
         4) hui__cmd_status; hui__cmd_doctor; printf '\n按回车返回… '; read -r _ ;;
         5) hui__cmd_report; printf '\n按回车返回… '; read -r _ ;;
@@ -4380,7 +4872,7 @@ hui__cmd_help() {
   行为：
     - 构建图输入没变时验证后直接编，跳过 kati+soong（这棵树 12 分钟起步）。
     - 首次构建没有图：先跑 m --skip-ninja 只生成图，再交给执行器编
-      （HUI_GRAPH_FIRST=0 可关）。
+      （构图也在面板里跑：显示子阶段 / 已用时间 / 最新输出；HUI_GRAPH_FIRST=0 可关）。
     - 内核快照命中但 out/ 里没落最终镜像：先单独补内核再编 ROM，避免
       full-LTO 链接和 ROM 抢内存（HUI_KERNEL_FIRST=0 可关）。
     - 执行器默认自建 hui（运行中可调并发、按任务分池）；HUI_EXECUTOR 可换。
@@ -4453,7 +4945,8 @@ EOF
   （HUI_TARGET > ROM 自带总目标 > bacon > otapackage > droid）。
 
   流程：
-    0. 没有构建图：先 m --skip-ninja 只生成图，再切执行器编（HUI_GRAPH_FIRST=0 关）
+    0. 没有构建图：先 m --skip-ninja 只生成图（同样在面板里跑），再切执行器编
+       （HUI_GRAPH_FIRST=0 关）
     1. 内核快照指纹匹配 → 直接恢复，跳过内核编译
     2. 构建图输入没变（约 5~10 秒校验）→ 跳过 kati+soong
     3. 快照命中但 out/ 里还没落最终内核镜像 → 先单独补内核，再编 ROM

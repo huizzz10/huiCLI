@@ -43,10 +43,17 @@ hui nabu-user bacon        # 指定构建目标
 hui lineage_nabu-user      # 直接给 lunch 串
 ```
 
-流程：`认 codename → lunch → 校验构建图 → 内核（必要时）→ 存快照 → ROM`。
+流程：`认 codename → lunch → 校验构建图（失效就在面板里生成）→ 内核（必要时）→ 存快照 → ROM`。
 
 - **构建图能复用**：验证后直接交执行器编，跳过 kati + soong 分析。
+- **构建图失效**：先在面板里跑 `m --skip-ninja` 生成三份图（kati + soong 分析，本机 10~15 分钟），
+  面板会显示子阶段 / 已用时间 / 最新输出，不再是黑盒 `m`；`HUI_GRAPH_FIRST=0` 关掉这一步。
 - **内核快照命中**：跳过内核直接编 ROM；内核编完立刻存快照，ROM 挂了也不影响。
+- **ROM 阶段不会再重编内核**：内核阶段/快照恢复之后，hui 会按依赖顺序理顺
+  `.config`、`Image*`、dtbo/dtb 和 `$OUT/kernel` 的 mtime，并把 `.ninja_log` 里
+  这些内核产物的记录时间一并刷新（ninja 除了比文件 mtime，还会比 log 里的记录时间）。
+  否则 Lineage `kernel.mk` 的 `config → Image` 依赖会让紧接着的 ROM 阶段（第二次 `m`）
+  再跑一遍 full-LTO 链接，和 ROM 编译并发时容易被 OOM 杀掉（`make: Error 137`）。
 - 回到「内核 + ROM 一次 `m`」的老模式：`HUI_COMBINE=1`。
 
 「内核编完了」不看 `Image` 在不在，而看 `KERNEL_OBJ/.hui-kernel-done`：标记只在
@@ -72,15 +79,27 @@ Tab 补全载入时自动注册（bash `complete -F`、zsh `compdef`），子命
 `<codename>-<variant>` 都能补，不用额外配置。
 
 构建时有个全屏面板：左栏机器与产品信息，右栏实时日志尾部，右下当前进度；
+构图阶段（kati + soong 分析）同样在面板里，进度行显示子阶段和已用时间，右下改刷最新输出；
 终端太窄或太矮会自动退回普通输出。
+
+没有面板时（管道/CI/终端太小）输出照样会落到 `<OUT_DIR>/hui/<codename>/hui-build-*.log`，
+失败时打印「失败报错」摘要和完整日志路径。内核/ROM 阶段如果像被内存打爆
+（`Error 137` / `已杀死` / `Killed process` / `oom-kill`），会自动降 3 路并发重试一次，
+增量续跑剩下的边。
 
 ## 构建图复用
 
 `m` 每次都要重跑 kati + soong_build 生成 ninja 图，本机上 12 分钟起步。hui 先校验现有图：
 soong depfile 里的 `Android.bp` 没变没少、`.globs` 结果没变、环境 / 产品 / 变体 /
-`OUT_DIR` 与图一致、`build/soong` 等没改。全过就由执行器直接读合并图
+`OUT_DIR` 与图一致、参与分析的 `build/soong` / `build/blueprint` Go 源码没改
+（`scripts/`、`tools/` 这类构建期脚本不算）。全过就由执行器直接读合并图
 `out/.hui-combined.<product>.ninja` 开编（图加载 2~6 秒）；
 任何一项拿不准就回退完整 `m`，**不拿旧图硬编**。
+
+`out/` 里被 soong 记成 glob 输入的构建产物（例如内核阶段编出来的
+`obj/DTBO_OBJ/.../dtbo.img`，来自 `BOARD_PREBUILT_DTBOIMAGE`）只有在**消失**时才算图失效；
+刚被内核编出来（新出现）不影响复用。内核快照的恢复也排在构图之前，所以快照里的
+DTBO/DTB 在生成图时就已经落盘，不会出现「这次构图、下次又重分析」的循环。
 
 ```bash
 hui graph --verify     # 看看为什么能 / 不能复用
@@ -190,7 +209,7 @@ hui clean --snapshot        # 只清内核快照
 | `HUI_MEM_PER_JOB` | `1.2` | 每个编译进程按多少 G 估 |
 | `HUI_MEM_RESERVE_MB` | `2048` | 准入时给系统预留多少 MB |
 | `HUI_GRAPH_REUSE` | `1` | `0` = 每次重跑 kati + soong |
-| `HUI_GRAPH_FIRST` | `1` | 首次没图时先 `m --skip-ninja` 只生成图，再交执行器编 |
+| `HUI_GRAPH_FIRST` | `1` | 首次没图时先在面板里 `m --skip-ninja` 生成图，再交执行器编 |
 | `HUI_KERNEL_FIRST` | `1` | 快照命中但 `out/` 没最终镜像时，先补内核再编 ROM |
 | `HUI_COMBINE` | `0` | `1` = 内核 / ROM 合成一次 `m`（老流程） |
 | `HUI_WATCHDOG` | `1` | `0` = 关掉运行中调速，固定并发 |
