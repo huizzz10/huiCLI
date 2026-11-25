@@ -28,6 +28,10 @@ python3 configure.py --bootstrap
 
 mkdir -p "$OUT"
 install -m 755 ninja "$OUT/hui"
+# 只留运行所需符号：7.6M -> 约 400K；构建机没有 strip 就跳过
+if command -v strip >/dev/null 2>&1; then
+    strip --strip-debug "$OUT/hui" 2>/dev/null || true
+fi
 cp "$SRC/COPYING" "$OUT/COPYING"
 cat > "$OUT/NOTICE" <<EOF
 hui executor

@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.5.3"
+HUI_VERSION="5.5.4"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -817,8 +817,10 @@ hui__cmd_status() {
     local rmax=$jobs
     hui__runa_like "$exe" && rmax=$cap
     case "$exe" in
-        runa) printf '  执行器      Runa（运行中可调并发）：%s\n' "$(hui__runa_bin 2>/dev/null || echo runa)" ;;
-        hui)  printf '  执行器      自建 hui（运行中可调并发）：%s\n' "$(hui__runa_bin 2>/dev/null || echo hui)" ;;
+        runa|hui)
+            printf '  执行器      %s（运行中可调并发）\n' "$(hui__executor_label "$exe")"
+            local exe_bin; exe_bin=$(hui__executor_bin_path "$exe" 2>/dev/null)
+            [ -n "$exe_bin" ] && printf '              %s\n' "$exe_bin" ;;
         siso) printf '  执行器      siso（运行中只能降，不能升）\n' ;;
         *)    printf '  执行器      m（原生，无运行中调节）\n' ;;
     esac
@@ -1170,6 +1172,19 @@ hui__runa_bin() {
     command -v hui-exec 2>/dev/null || command -v runa 2>/dev/null
 }
 
+# 只找 Runa（显式 HUI_EXECUTOR=runa 时用；不能又把 hui 二进制当成 Runa）
+hui__runa_only_bin() {
+    local c
+    for c in "${HUI_EXECUTOR_BIN:-}" \
+             "${HUI_RUNA:-}" \
+             "${HUI_HOME:+$HUI_HOME/prebuilts/runa/runa}" \
+             "${HUI_TOP:+$HUI_TOP/vendor/hui/prebuilts/runa/runa}" \
+             "${HUI_TOP:+$HUI_TOP/hui/prebuilts/runa/runa}"; do
+        [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    command -v runa 2>/dev/null
+}
+
 # 自建 hui 执行器（只找 hui，不回退到 runa）
 hui__hui_bin() {
     local c
@@ -1180,6 +1195,30 @@ hui__hui_bin() {
         [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }
     done
     return 1
+}
+
+# 当前策略下执行器实际用的二进制路径（给 status/启动信息和 label 共用）
+hui__executor_bin_path() {
+    case "${1:-}" in
+        hui)  hui__hui_bin ;;
+        runa) hui__runa_only_bin ;;
+        *)    return 1 ;;
+    esac
+}
+
+# 执行器显示串：名称 + 版本 + 短 SHA（只对 hui/runa；找不到就只给名字）
+hui__executor_label() {
+    local exe=${1:-} bin ver sha name
+    case "$exe" in
+        hui)  name="自建 hui" ;;
+        runa) name="Runa" ;;
+        *)    printf '%s' "${exe:-?}"; return 0 ;;
+    esac
+    bin=$(hui__executor_bin_path "$exe" 2>/dev/null)
+    [ -n "$bin" ] || { printf '%s' "$name"; return 0; }
+    ver=$("$bin" --version 2>/dev/null | head -n 1)
+    sha=$(sha256sum -- "$bin" 2>/dev/null | cut -d' ' -f1 | cut -c1-12)
+    printf '%s %s · sha256 %s' "$name" "${ver:-?}" "${sha:-?}"
 }
 
 # 自建 hui 与 Runa 同属“ninja 兼容 + --parallelism-file”，下游按同一类处理。
@@ -1195,7 +1234,11 @@ hui__runa_ok() {
     local r
     [ "${HUI__RUNA_OK:-}" = "1" ] && return 0
     [ "${HUI__RUNA_OK:-}" = "0" ] && return 1
-    r=$(hui__runa_bin) || { HUI__RUNA_OK=0; return 1; }
+    case "$(printf '%s' "${HUI_EXECUTOR:-auto}" | tr 'A-Z' 'a-z')" in
+        runa|runa-ninja) r=$(hui__runa_only_bin) ;;
+        *)               r=$(hui__runa_bin) ;;
+    esac
+    [ -n "$r" ] || { HUI__RUNA_OK=0; return 1; }
     if "$r" --help 2>&1 | grep -q -- '--parallelism-file'; then
         HUI__RUNA_OK=1
         HUI__RUNA_PATH=$r
@@ -1217,7 +1260,10 @@ hui__executor() {
     local forced out
     forced=$(printf '%s' "${HUI_EXECUTOR:-auto}" | tr '[:upper:]' '[:lower:]')
     case "$forced" in
-        runa|runa-ninja) printf 'runa'; return 0 ;;
+        runa|runa-ninja)
+            if [ -n "$(hui__runa_only_bin)" ]; then printf 'runa'; return 0; fi
+            hui__warn "HUI_EXECUTOR=runa，但没找到 Runa（prebuilts/runa/runa / HUI_RUNA），回退 auto" >&2
+            ;;
         hui|ninja-hui)
             if [ -n "$(hui__hui_bin)" ]; then printf 'hui'; return 0; fi
             hui__warn "HUI_EXECUTOR=hui，但没找到自建执行器（hui/prebuilts/hui/hui），回退 auto" >&2
@@ -3436,7 +3482,11 @@ hui__runa_run() {
     local out=${OUT_DIR:-out} product runa ceiling dir file rc
     product=${HUI__PRODUCT:-${TARGET_PRODUCT:-}}
     [ -n "$product" ] || { hui__err "认不出产品，无法复用构建图"; return 127; }
-    runa=$(hui__runa_bin) || { hui__err "缺少执行器：prebuilts/hui/hui 和 prebuilts/runa/runa 都不可用"; return 127; }
+    case "$(printf '%s' "${HUI_EXECUTOR:-auto}" | tr 'A-Z' 'a-z')" in
+        runa|runa-ninja) runa=$(hui__runa_only_bin) ;;
+        *)               runa=$(hui__runa_bin) ;;
+    esac
+    [ -n "$runa" ] || { hui__err "缺少执行器：prebuilts/hui/hui 和 prebuilts/runa/runa 都不可用"; return 127; }
     ceiling=${HUI_RUNA_CEILING:-$(hui__jobs_max)}
     case "$ceiling" in ''|*[!0-9]*) ceiling=$jobs ;; esac
     [ "$ceiling" -lt "$jobs" ] && ceiling=$jobs
@@ -4322,6 +4372,7 @@ hui__cmd_build() {
     hui__panel_config
     local jobs; jobs=$(hui__jobs_start)
     hui__highmem_refresh "$jobs"
+    hui__say "执行器 $(hui__executor_label "$(hui__executor)")"
     hui__say "并发 -j$jobs（上限 $(hui__jobs_max) · 运行中 $(hui__jobs_min)~$jobs）· 高内存 $HUI_HIGHMEM_JOBS 路"
     hui__pools_export "$jobs"
     local pool_line; pool_line=$(hui__pools_summary)

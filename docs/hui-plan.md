@@ -80,9 +80,9 @@
 - 源码：`third_party/ninja/`（含 `src/`、`misc/`、`configure.py`、`COPYING`）。
 - 补丁：`third_party/ninja/hui.patch`
   - SHA-256：`b73375ce7f7b3477563f2d6c94774afba2d1097d8a2e1278fb7df0647e710342`
-- 二进制：`prebuilts/hui/hui`（`--version` 输出 `1.12.1`）
-  - SHA-256：`58d77518809addee7d374f5646f366aa1ab907a9185ac22488163c69f875e3a0`
-- 重建：
+- 二进制：`prebuilts/hui/hui`（`--version` 输出 `1.12.1`；已 `strip --strip-debug`，约 400K）
+  - SHA-256：`5e9c414066b33e93064519fe545d7f81f608a5e8e3185cdaab3f5c6f812b1759`
+- 重建（脚本会顺手 strip）：
 
   ```bash
   hui/tools/build-executor.sh      # python3 + 宿主 g++，产物覆盖 prebuilts/hui/hui
@@ -108,8 +108,9 @@
 - `HUI_JOBS` / `HUI_JOBS_MIN` / `HUI_MEM_*` / `HUI_CTRL_*`：并发与准入参数
   （v5.5.3 起运行中是 前馈 + PI(D) 控制器，见 README）。
 
-`hui status` / 启动面板目前显示执行器**名称与路径**；**版本号和 SHA-256 尚未显示**
-（见 §7 的待办）。
+`hui status` 和构建启动行会显示执行器**名称、版本和短 SHA-256**，`hui status`
+另起一行显示二进制路径（v5.5.4 起）。显式 `HUI_EXECUTOR=runa` 现在只会解析
+Runa 二进制，不会再把 `prebuilts/hui/hui` 当成 Runa 用（v5.5.4 修复）。
 
 ## 6. 分池
 
@@ -133,9 +134,9 @@
       `HUI_EXECUTOR=runa` 的可选回退
 - [ ] 严格同图 A/B（同机器、同图，对比 Runa 的 `perf.tsv` 墙钟与 PSI）——
       未做；已有真实构建记录（见 §8），但不是受控对比
-- [ ] `hui status` / 启动日志显示执行器版本与 SHA-256——未做
-- [ ] （可选）`prebuilts/hui/hui` 当前未 strip（约 7.6M），可 `strip --strip-debug`
-      压到约 400K，并同步 `build-executor.sh`
+- [x] `hui status` / 启动日志显示执行器版本与 SHA-256（v5.5.4）
+- [x] `prebuilts/hui/hui` 已 strip（7.6M → 约 400K），`build-executor.sh` 同步
+- [x] 显式 `HUI_EXECUTOR=runa` 只解析 Runa 二进制，不再误用 hui（v5.5.4 修复）
 
 ## 8. 实测记录（非受控对比）
 
@@ -163,8 +164,6 @@
 
 ## 10. 后续（可选）
 
-1. `hui status` / 启动日志补版本 + SHA-256；
-2. strip `prebuilts/hui/hui` 并同步构建脚本；
-3. 有需要时在 CI 校验二进制哈希；
-4. 真正的同图 A/B（成本较高，按需）；
-5. Runa 的上游可复现性/许可核对（见 `runa-provenance.md` 第 6 节，已决定保留）。
+1. 有需要时在 CI 校验二进制哈希；
+2. 真正的同图 A/B（成本较高，按需）；
+3. Runa 的上游可复现性/许可核对（见 `runa-provenance.md` 第 6 节，已决定保留）。
