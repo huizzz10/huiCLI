@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.5.4"
+HUI_VERSION="5.5.5"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -3482,6 +3482,9 @@ hui__runa_run() {
     local out=${OUT_DIR:-out} product runa ceiling dir file rc
     product=${HUI__PRODUCT:-${TARGET_PRODUCT:-}}
     [ -n "$product" ] || { hui__err "认不出产品，无法复用构建图"; return 127; }
+    # 进执行器之前最后确认一次账本：前面不管是构图、裸 m 还是别的 shell 动过它，
+    # 只要 .hui 里还有 v6 备份就回滚 —— 否则这里一启动就是 22 万条边全量。
+    hui__ledger_restore
     case "$(printf '%s' "${HUI_EXECUTOR:-auto}" | tr 'A-Z' 'a-z')" in
         runa|runa-ninja) runa=$(hui__runa_only_bin) ;;
         *)               runa=$(hui__runa_bin) ;;
@@ -3557,33 +3560,23 @@ hui__runa_run() {
 # 原生 ninja（AOSP 自带 1.9）写 v5，自建 hui（1.12.1）写 v6，
 # 读到旧版本会 "starting over"，等于全量重建。
 hui__ninja_log_guard() {
-    local log v exe bak
+    local log v exe
     log=$(hui__ninja_log)
 
-    # 上次构图被中断时，可能留下 v6 备份而账本已被 siso 改成 v5；
-    # 先把这个备份恢复回去，否则这一轮还是会全量。
-    bak=$(hui__ledger_backup_path)
-    if [ -s "$bak" ]; then
-        if [ "$(hui__ledger_version "$log" 2>/dev/null)" != "6" ]; then
-            if cp -f -- "$bak" "$log" 2>/dev/null; then
-                hui__dim "  已恢复上次构图前的 v6 增量账本（否则整树重编）" >&2
-                rm -f -- "$bak" 2>/dev/null
-            else
-                hui__warn "v6 账本备份还在（$bak），但恢复失败，下次构建会再试" >&2
-            fi
-        else
-            rm -f -- "$bak" 2>/dev/null
-        fi
-    fi
+    # 账本可能在上一次构图（soong bootstrap 走 siso）或任何一次裸 m 里被
+    # 截成 v5 头 —— 那种情况下自建执行器会 "starting over"，整树重编。
+    # 只要 .hui 里还留着 v6 备份，这里就把它捡回来。
+    hui__ledger_restore
 
     [ -s "$log" ] || return 0
-    v=$(head -1 "$log" 2>/dev/null | sed -n 's/^# ninja log v\([0-9][0-9]*\)$/\1/p')
+    v=$(hui__ledger_version "$log" 2>/dev/null)
     [ -n "$v" ] || return 0
     exe=$(hui__executor)
     case "$exe" in
         hui|runa)
             [ "$v" -ge 6 ] && return 0
             hui__warn "增量账本是 v$v，自建执行器写 v6：这次会被当成全量重建（约 2~3 小时）"
+            hui__dim "  .hui 里没有可用的 v6 备份，只能全量一次；编完会自动留一份给下次"
             hui__dim "  想保留现有增量：HUI_EXECUTOR=m hui build；长期用同一个执行器最稳"
             ;;
     esac
@@ -3619,35 +3612,65 @@ hui__ledger_version() {
     [ -n "$v" ] && printf '%s' "$v"
 }
 
-hui__graph_ledger_guard() {
-    local log bak before after rc
+# 「好账本」常驻备份：当前是 v6 就刷新一份到 .hui（内容没变就跳过）。
+# 以前的备份只活在「构图前 → 构图后」这一小段里，构图结束就删；于是
+#   ① 构图前账本已经被别的东西（裸 m / 上次被 Ctrl-C 的 siso）截成 v5 时没得救；
+#   ② 构图之后隔了一个 shell 再构建，备份早没了。
+# 现在备份跨命令、跨 shell 都留着，任何一次 hui 构建开跑前都能回滚。
+hui__ledger_sync() {
+    local log bak
     log=$(hui__ninja_log)
     bak=$(hui__ledger_backup_path)
+    [ "$(hui__ledger_version "$log" 2>/dev/null)" = "6" ] || return 1
     mkdir -p -- "${bak%/*}" 2>/dev/null
-    before=$(hui__ledger_version "$log" 2>/dev/null)
-    if [ "$before" = "6" ]; then
-        cp -f -- "$log" "$bak" 2>/dev/null || bak=""
-    else
-        bak=""
-    fi
+    cmp -s -- "$log" "$bak" 2>/dev/null && return 0
+    cp -f -- "$log" "$bak" 2>/dev/null
+}
 
+# 账本不是 v6（被 siso / ninja 1.9 截成 v5 头，或者干脆被删）时用备份回滚。
+# 返回 0 = 现在账本是 v6（本来就是，或刚恢复好）；1 = 没有可用的 v6 备份。
+# 真回滚过会把 HUI__LEDGER_RESTORED 置 1（调用方在子 shell 里也能用来决定提示）。
+hui__ledger_restore() {
+    local log bak v bv
+    log=$(hui__ninja_log)
+    bak=$(hui__ledger_backup_path)
+    v=$(hui__ledger_version "$log" 2>/dev/null)
+    [ "$v" = "6" ] && return 0
+    bv=$(hui__ledger_version "$bak" 2>/dev/null)
+    [ "$bv" = "6" ] || return 1
+    cp -f -- "$bak" "$log" 2>/dev/null || return 1
+    HUI__LEDGER_RESTORED=1
+    hui__warn "增量账本被写成 v${v:-?}（siso / ninja 1.9 的副作用），已用 .hui 备份恢复 v6 —— 本次不会全量"
+    return 0
+}
+
+hui__ledger_restored_mark() {
+    printf '%s' "${HUI_STATE:-$HUI_TOP/.hui}/.ledger-restored"
+}
+
+hui__graph_ledger_guard() {
+    local log rc
+    log=$(hui__ninja_log)
+
+    # 构图前：把当前 v6 账本刷进常驻备份（账本已经是 v5 的话 sync 会失败，
+    # 这时反而是上一份备份更值钱，不能删）。
+    hui__ledger_sync
+
+    HUI__LEDGER_RESTORED=0
     "$@"
     rc=$?
 
-    if [ -n "$bak" ] && [ -f "$bak" ]; then
-        after=$(hui__ledger_version "$log" 2>/dev/null)
-        if [ "$after" != "6" ]; then
-            if cp -f -- "$bak" "$log" 2>/dev/null; then
-                printf '%s[hui]%s 构图把增量账本改写成 v%s，已恢复 v6 账本（否则整树重编）\n' \
-                    "$hui__c_yel" "$hui__c_rst" "${after:-?}" >&2
-                rm -f -- "$bak" 2>/dev/null
-            else
-                printf '%s[hui]%s 账本恢复失败，v6 备份保留在 %s（下次构建会再试）\n' \
-                    "$hui__c_yel" "$hui__c_rst" "$bak" >&2
-            fi
-        else
-            rm -f -- "$bak" 2>/dev/null
+    # 构图只生成图、不动任何产物，所以 soong bootstrap（siso）把
+    # out/.ninja_log 截成 v5 之后，直接用 v6 备份回滚是安全的。
+    if hui__ledger_restore; then
+        # 构图在面板子 shell 里跑，这里打的字只会落进阶段日志；
+        # 留个标记，让主流程回终端补一句。
+        if [ "${HUI__LEDGER_RESTORED:-0}" = "1" ]; then
+            : >| "$(hui__ledger_restored_mark)" 2>/dev/null
         fi
+    else
+        printf '%s[hui]%s 构图把增量账本改成了 v%s，且 .hui 里没有 v6 备份 —— 这次构建会全量\n' \
+            "$hui__c_yel" "$hui__c_rst" "$(hui__ledger_version "$log" 2>/dev/null || echo '?')" >&2
     fi
     return $rc
 }
@@ -4420,6 +4443,14 @@ hui__cmd_build() {
         fi
     fi
 
+    # 构图（soong bootstrap 走 siso）会把 out/.ninja_log 截成 v5；
+    # 账本 guard 已经回滚成 v6，这里在终端补一句，别让人以为「什么都没发生」。
+    if [ -f "$(hui__ledger_restored_mark)" ]; then
+        hui__ok "构图把增量账本写成了 v5，已回滚 v6（本次是增量，不会全量）"
+        hui__dim "  没这一下就是整树 22 万条边重编：siso 会截断账本，自建执行器只认 v6"
+        rm -f -- "$(hui__ledger_restored_mark)" 2>/dev/null
+    fi
+
     [ "$HUI__M_FAST" = "1" ] && hui__phase_done "构建图完成"
 
     if [ "$rrc" -eq 2 ] && [ -n "${HUI__KS:-}" ]; then
@@ -4477,6 +4508,9 @@ hui__cmd_build() {
         local total=$(( $(date +%s) - hui__t0 ))
         HUI__LAST_SECONDS=$total
         hui__phase_done "ROM完成"
+        # 这轮编完账本是 v6 且最全，刷进 .hui 常驻备份：
+        # 下次不管是构图还是裸 m 把账本截成 v5，都能回滚到「这次编完」的状态。
+        hui__ledger_sync
         # 内核可能是在这次 m 里编的（没走 hui 的内核阶段）：补写完成标记，
         # 否则 hui save 会拒绝，下次构建还会误以为内核不完整。
         local po3; po3=$(hui__prodout "$HUI__PRODUCT")
@@ -4750,6 +4784,9 @@ hui__cmd_clean() {
             hui__say "清理内核快照 ${snap#$HUI_TOP/}"
             _hui_clean_guard "$snap" && rm -rf --one-file-system -- "$snap"
         fi
+        # out/ 都清了，账本备份也就没意义了；留着反而会在下次构建时
+        # 把一堆早就不存在的产物记成「已编过」。
+        rm -f -- "$(hui__ledger_backup_path)" "$(hui__ledger_restored_mark)" 2>/dev/null
         if [ "$do_ccache" = "1" ]; then
             hui__say "清理 ccache $cdir"
             ccache -C >/dev/null 2>&1 || rm -rf --one-file-system -- "$cdir"
