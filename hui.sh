@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.4.2"
+HUI_VERSION="5.5.3"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -1093,18 +1093,31 @@ hui__highmem_refresh() {
     HUI_HIGHMEM_JOBS=$(hui__highmem_jobs "${1:-}")
 }
 
-# 内存准入：按「当前可用内存 − 预留」估计这一刻最多该跑几路。
+# 内存准入：按「当前可用内存 + 一半空闲 swap − 预留」估计这一刻最多该跑几路。
 # 这是实际并发的来源；hui__jobs_max 只是硬上限（核数）。
+# 空闲 swap 只算一半：swap 是慢速兜底，全算进来会让起手值过于激进而引发换页；
+# 但一点都不算，在 30G 内存 + 60G swap 的机器上又永远到不了满核。
 # 预留 HUI_MEM_RESERVE_MB 是留给系统/桌面/回写的余量，别让编译器把内存吃干。
 hui__mem_jobs_admit() {
-    local n a per res
+    local n a sw per res frac
     n=$(hui__jobs_max)
     a=$(hui__mem_available_mb)
     case "$a" in ''|*[!0-9]*) a=8192 ;; esac
+    sw=$(hui__swap_free_mb)
+    case "$sw" in ''|*[!0-9]*) sw=0 ;; esac
     per=${HUI_MEM_PER_JOB:-1.2}
+    case "$per" in ''|*[!0-9.]*|*.*.*) per=1.2 ;; esac
+    awk -v p="$per" 'BEGIN{exit !(p > 0)}' 2>/dev/null || per=1.2
     res=${HUI_MEM_RESERVE_MB:-2048}
-    awk -v a="$a" -v per="$per" -v res="$res" -v n="$n" 'BEGIN{
-        v = (a - res) / (per * 1024)
+    case "$res" in ''|*[!0-9]*) res=2048 ;; esac
+    frac=${HUI_MEM_SWAP_FRACTION:-0.5}
+    case "$frac" in ''|*[!0-9.]*|*.*.*) frac=0.5 ;; esac
+    awk -v f="$frac" 'BEGIN{exit !(f >= 0 && f <= 1)}' 2>/dev/null || frac=0.5
+    awk -v a="$a" -v sw="$sw" -v per="$per" -v res="$res" -v n="$n" -v frac="$frac" 'BEGIN{
+        credit = frac * sw
+        # swap 折算不能超过当前可用内存：RAM 快满、swap 全空时不该按 swap 起手。
+        if (credit > a) credit = a
+        v = (a + credit - res) / (per * 1024)
         if (v > n) v = n
         if (v < 1) v = 1
         printf "%d", v
@@ -1241,12 +1254,32 @@ hui__admit_lib() {
 }
 
 hui__admit_start() {
-    local file=$1 initial=$2 ceiling=$3 lib
+    local file=$1 initial=$2 ceiling=$3 lib floor policy tick ctrl_log
     command -v python3 >/dev/null 2>&1 || return 0
     lib=$(hui__admit_lib) || return 0
+    # pid 用独立的 floor（HUI_CTRL_FLOOR，默认 2）；用户显式设了 HUI_JOBS_MIN
+    # 就以它为准。legacy 保留旧行为（可降到 1，不使用这个 floor）。
+    if [ -n "${HUI_JOBS_MIN:-}" ]; then
+        floor=$HUI_JOBS_MIN
+    else
+        floor=${HUI_CTRL_FLOOR:-2}
+    fi
+    case "$floor" in ''|*[!0-9]*) floor=1 ;; esac
+    [ "$floor" -lt 1 ] && floor=1
+    [ "$floor" -gt "$initial" ] && floor=$initial
+    policy=$(printf '%s' "${HUI_ADMIT_POLICY:-pid}" | tr 'A-Z' 'a-z')
+    case "$policy" in legacy|pid) ;; *) policy=pid ;; esac
+    tick=${HUI_ADMIT_TICK:-1}
+    case "$tick" in ''|*[!0-9.]*|*.*.*) tick=1 ;; esac
+    awk -v t="$tick" 'BEGIN{exit !(t >= 0.2)}' 2>/dev/null || tick=1
+    # 控制器日志必须单独落盘：阶段日志是构建 stdout 的 > 重定向，
+    # 和这里的 append 抢文件偏移，写进去会被覆盖（之前 admission 行时有时无就是这原因）。
+    ctrl_log="$(hui__state_dir)/ctrl-${HUI__PRODUCT:-build}.log"
+    mkdir -p -- "${ctrl_log%/*}" 2>/dev/null
     python3 "$lib" --file "$file" --initial "$initial" --ceiling "$ceiling" \
+        --floor "$floor" --policy "$policy" --ctrl-log "$ctrl_log" \
         --parent "$$" --stat "${HUI__STAT_FILE:-}" --log "${HUI__LOG_FILE:-}" \
-        --tick "${HUI_ADMIT_TICK:-2}" >/dev/null 2>&1 &
+        --tick "$tick" >/dev/null 2>&1 &
     HUI__ADMIT_PID=$!
     return 0
 }
@@ -1278,7 +1311,60 @@ hui__jobs_start() {
     [ "$j" -lt "$minj" ] && j=$minj
     printf '%s' "$j"
 }
-hui__jobs_min() { printf '%s' "${HUI_JOBS_MIN:-6}"; }
+# 下限不是死的：HUI_JOBS_MIN 只是“内存够时的下限”。
+# 内存真的紧时允许压得更低（2~4 路），否则 6 路一起换页只会更慢。
+hui__jobs_min() {
+    local floor=${HUI_JOBS_MIN:-6} a per f
+    case "$floor" in ''|*[!0-9]*) floor=6 ;; esac
+    [ "$floor" -ge 1 ] || floor=1
+    a=$(hui__mem_available_mb)
+    case "$a" in ''|*[!0-9]*) printf '%s' "$floor"; return 0 ;; esac
+    per=${HUI_MEM_PER_JOB:-1.2}
+    case "$per" in ''|*[!0-9.]*|*.*.*) per=1.2 ;; esac
+    awk -v p="$per" 'BEGIN{exit !(p > 0)}' 2>/dev/null || per=1.2
+    f=$(awk -v a="$a" -v per="$per" 'BEGIN{
+        v = int(a / (per * 1024 * 2))
+        if (v < 1) v = 1
+        printf "%d", v
+    }')
+    [ "$f" -lt "$floor" ] && floor=$f
+    printf '%s' "$floor"
+}
+
+# 构图（m --skip-ninja / soong bootstrap）不是 1 任务 1 线程的编译负载，
+# -j 给太大只会把内存压进 swap（实测 -j32 构图时 PSI 60%+）。
+# 默认取核数一半（最少 4，且不超过编译并发），HUI_GRAPH_JOBS 可覆盖。
+hui__graph_jobs() {
+    local jobs=${1:-} gj n mem_mb mem_cap auto_scale=1
+    n=$(nproc 2>/dev/null || echo 8)
+    case "$n" in ''|*[!0-9]*) n=8 ;; esac
+    case "$(printf '%s' "${HUI_CPU_SCALE:-auto}" | tr 'A-Z' 'a-z')" in
+        0|off|false|no|manual) auto_scale=0 ;;
+    esac
+    gj=${HUI_GRAPH_JOBS:-}
+    case "$gj" in ''|*[!0-9]*) gj="" ;; esac
+    if [ -z "$gj" ] || [ "$gj" -lt 1 ]; then
+        gj=$(( n / 2 ))
+        [ "$gj" -lt 4 ] && gj=4
+        if [ "$auto_scale" = "1" ]; then
+            # 构图也是内存重活：再按总内存的一半封一次顶，并限制在 32 路内。
+            mem_mb=$(hui__mem_total_mb 2>/dev/null)
+            case "$mem_mb" in ''|*[!0-9]*) mem_mb=0 ;; esac
+            if [ "$mem_mb" -gt 0 ]; then
+                mem_cap=$(( mem_mb / 2048 ))
+                [ "$mem_cap" -lt 4 ] && mem_cap=4
+                [ "$gj" -gt "$mem_cap" ] && gj=$mem_cap
+            fi
+            [ "$gj" -gt 32 ] && gj=32
+        fi
+    fi
+    [ "$gj" -gt "$n" ] && gj=$n
+    if [ -n "$jobs" ]; then
+        case "$jobs" in ''|*[!0-9]*) : ;; *) [ "$gj" -gt "$jobs" ] && gj=$jobs ;; esac
+    fi
+    [ "$gj" -lt 1 ] && gj=1
+    printf '%s' "$gj"
+}
 
 # 每类高内存任务的并发池：池深 = (可用内存 - 预留) / 该类单任务预算。
 # 只对支持 HUI_POOL_* 的执行器生效（自建 hui / 将来的执行器）；
@@ -2727,6 +2813,9 @@ hui__last_log_mark() {
 hui__run_phase_dashboard() {
     local label=$1 jobs=$2; shift 2
     local mode=${HUI__PHASE_MODE:-build}
+    if [ "$mode" = "graph" ]; then
+        jobs=$(hui__graph_jobs "$jobs")
+    fi
     (
         [ -n "${HUI_TOP:-}" ] || HUI_TOP=.
         [ -n "${HUI_STATE:-}" ] || HUI_STATE="$HUI_TOP/.hui"
@@ -2750,6 +2839,7 @@ hui__run_phase_dashboard() {
         hui__highmem_refresh "$jobs"
         HUI__JOBS_MAX=$jobs
         hui__runa_like "$phase_exec" && HUI__JOBS_MAX=$(hui__jobs_max)
+        [ "$mode" = "graph" ] && HUI__JOBS_MAX=$jobs
         HUI__PHASE_START=$(date +%s)
         HUI__STAT_FILE=$(mktemp "${TMPDIR:-/tmp}/hui-stat.XXXXXX" 2>/dev/null)
         HUI__DASH_LEFT=$(mktemp "${TMPDIR:-/tmp}/hui-left.XXXXXX" 2>/dev/null)
@@ -2836,7 +2926,7 @@ hui__run_phase_dashboard() {
           # 构图：只让 m 做 kati+soong 分析、写出三份图，不进编译。
           # 走和编译阶段同一套面板/日志/中断清理，只是面板切到「构图模式」。
           if [ "$mode" = "graph" ]; then
-              m -j"$jobs" --skip-ninja "$@"
+              hui__graph_ledger_guard m -j"$jobs" --skip-ninja "$@"
           else
               hui__m_run "$jobs" "$@"
           fi ) >| "$log" 2>&1 &
@@ -3417,11 +3507,25 @@ hui__runa_run() {
 # 原生 ninja（AOSP 自带 1.9）写 v5，自建 hui（1.12.1）写 v6，
 # 读到旧版本会 "starting over"，等于全量重建。
 hui__ninja_log_guard() {
-    local outd=${OUT_DIR:-out} log v exe
-    case "$outd" in
-        /*) log="$outd/.ninja_log" ;;
-        *)  log="$HUI_TOP/$outd/.ninja_log" ;;
-    esac
+    local log v exe bak
+    log=$(hui__ninja_log)
+
+    # 上次构图被中断时，可能留下 v6 备份而账本已被 siso 改成 v5；
+    # 先把这个备份恢复回去，否则这一轮还是会全量。
+    bak=$(hui__ledger_backup_path)
+    if [ -s "$bak" ]; then
+        if [ "$(hui__ledger_version "$log" 2>/dev/null)" != "6" ]; then
+            if cp -f -- "$bak" "$log" 2>/dev/null; then
+                hui__dim "  已恢复上次构图前的 v6 增量账本（否则整树重编）" >&2
+                rm -f -- "$bak" 2>/dev/null
+            else
+                hui__warn "v6 账本备份还在（$bak），但恢复失败，下次构建会再试" >&2
+            fi
+        else
+            rm -f -- "$bak" 2>/dev/null
+        fi
+    fi
+
     [ -s "$log" ] || return 0
     v=$(head -1 "$log" 2>/dev/null | sed -n 's/^# ninja log v\([0-9][0-9]*\)$/\1/p')
     [ -n "$v" ] || return 0
@@ -3434,6 +3538,68 @@ hui__ninja_log_guard() {
             ;;
     esac
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# 构图阶段的账本保护
+#
+# hui 构图走 `m --skip-ninja`。soong 需要重新生成图时会先跑 bootstrap，
+# 这棵树默认用 siso 做 bootstrap，而 siso 收尾会把 out/.ninja_log 重写成 v5。
+# 自建执行器（ninja 1.12.1）只认 v6，读到 v5 会 unlink 账本，下一轮所有
+# 非 generator 边都“command line not found in log”，整棵树重编。
+# 构图只生成图、不动编译产物，所以在构图前备份 v6 账本、构图后恢复即可。
+# HUI_STATE 允许是相对路径（help 里写 .hui）。统一解析到 tree 根目录下，
+# 避免从子目录调用 hui 时把备份/Ctrl 日志写到没人看的地方。
+hui__state_dir() {
+    local d=${HUI_STATE:-.hui}
+    case "$d" in
+        /*) printf '%s' "$d" ;;
+        *)  printf '%s' "${HUI_TOP:-.}/$d" ;;
+    esac
+}
+
+hui__ledger_backup_path() {
+    printf '%s' "$(hui__state_dir)/.ninja_log.v6-backup"
+}
+
+hui__ledger_version() {
+    local f=$1 v
+    [ -s "$f" ] || return 1
+    v=$(head -n 1 "$f" 2>/dev/null | sed -n 's/^# ninja log v\([0-9][0-9]*\)$/\1/p')
+    [ -n "$v" ] && printf '%s' "$v"
+}
+
+hui__graph_ledger_guard() {
+    local log bak before after rc
+    log=$(hui__ninja_log)
+    bak=$(hui__ledger_backup_path)
+    mkdir -p -- "${bak%/*}" 2>/dev/null
+    before=$(hui__ledger_version "$log" 2>/dev/null)
+    if [ "$before" = "6" ]; then
+        cp -f -- "$log" "$bak" 2>/dev/null || bak=""
+    else
+        bak=""
+    fi
+
+    "$@"
+    rc=$?
+
+    if [ -n "$bak" ] && [ -f "$bak" ]; then
+        after=$(hui__ledger_version "$log" 2>/dev/null)
+        if [ "$after" != "6" ]; then
+            if cp -f -- "$bak" "$log" 2>/dev/null; then
+                printf '%s[hui]%s 构图把增量账本改写成 v%s，已恢复 v6 账本（否则整树重编）\n' \
+                    "$hui__c_yel" "$hui__c_rst" "${after:-?}" >&2
+                rm -f -- "$bak" 2>/dev/null
+            else
+                printf '%s[hui]%s 账本恢复失败，v6 备份保留在 %s（下次构建会再试）\n' \
+                    "$hui__c_yel" "$hui__c_rst" "$bak" >&2
+            fi
+        else
+            rm -f -- "$bak" 2>/dev/null
+        fi
+    fi
+    return $rc
 }
 
 # 阶段完成提示：右上 PHASE 逐段追加（构建图完成 / 内核完成 / ROM完成）
@@ -3628,6 +3794,9 @@ hui__kernel_settle() {
 hui__run_phase() {
     local label=$1 jobs=$2; shift 2
     local mode=${HUI__PHASE_MODE:-build}
+    if [ "$mode" = "graph" ]; then
+        jobs=$(hui__graph_jobs "$jobs")
+    fi
     if hui__dash_available; then
         hui__run_phase_dashboard "$label" "$jobs" "$@"
         return $?
@@ -3637,6 +3806,7 @@ hui__run_phase() {
     hui__highmem_refresh "$jobs"
     HUI__JOBS_MAX=$jobs
     hui__runa_like "$phase_exec" && HUI__JOBS_MAX=$(hui__jobs_max)
+    [ "$mode" = "graph" ] && HUI__JOBS_MAX=$jobs
     HUI__PHASE_START=$(date +%s)
     HUI__STAT_FILE=$(mktemp "${TMPDIR:-/tmp}/hui-stat.XXXXXX" 2>/dev/null)
 
@@ -3680,7 +3850,7 @@ hui__run_phase() {
       export CCACHE_DIRECT="${CCACHE_DIRECT:-${HUI_CCACHE_DIRECT:-1}}"
       hui__lower_priority
       if [ "$mode" = "graph" ]; then
-          m -j"$jobs" --skip-ninja "$@"
+          hui__graph_ledger_guard m -j"$jobs" --skip-ninja "$@"
       else
           hui__m_run "$jobs" "$@"
       fi ) >| "$log" 2>&1 &
@@ -4276,7 +4446,13 @@ hui__cmd_build() {
 }
 
 # 执行器的 ninja 日志（自建 hui / Runa / soong_ui 都写这一份）
-hui__ninja_log() { printf '%s' "${HUI_NINJA_LOG:-$HUI_TOP/${OUT_DIR:-out}/.ninja_log}"; }
+hui__ninja_log() {
+    local outd=${OUT_DIR:-out}
+    case "$outd" in
+        /*) printf '%s' "${HUI_NINJA_LOG:-$outd/.ninja_log}" ;;
+        *)  printf '%s' "${HUI_NINJA_LOG:-$HUI_TOP/$outd/.ninja_log}" ;;
+    esac
+}
 
 # 历史耗时：.ninja_log -> "<ms>\t<output>"；给执行器 --duration-file 用。
 hui__durations_build() {
@@ -4956,6 +5132,9 @@ hui__help_cmd() {
     HUI_MEM_ADMIT=0           关掉内存准入（危险）
     HUI_MEM_PER_JOB=1.2       每个编译进程按多少 G 估
     HUI_MEM_RESERVE_MB=2048   准入时给系统预留 MB
+    HUI_MEM_SWAP_FRACTION=0.5 准入时把多少空闲 swap 算作可用内存
+    HUI_GRAPH_JOBS=16         构图阶段并发（默认核数一半，再按内存封顶，≤32）
+    HUI_CPU_SCALE=auto        按核数/内存自适应（off = 固定 1/2 路每秒、nproc/2 构图）
     HUI_NICE=10               构建进程 nice；0 = 不降
     HUI_IONICE=6              ionice 等级；HUI_IONICE_CLASS=3 = idle
     HUI_COMBINE=1             内核/ROM 合成一次 m
@@ -4986,7 +5165,28 @@ hui__help_cmd() {
     HUI_NO_KATI=1             图没生成时跳过 kati 分析（TUI 快速启动）
     HUI_NINJA_LOG=…           覆盖 .ninja_log 路径
     HUI_CTRL_DEBUG=1          调速控制器调试输出
-    HUI_ADMIT_TICK=2          Runa 准入采样周期（秒）
+    HUI_ADMIT_TICK=1          运行中准入采样周期（秒）
+    HUI_ADMIT_POLICY=pid      准入策略：pid（前馈+PI(D)，默认）| legacy（台阶式）
+    HUI_CTRL_SETPOINT=0.30    PID 目标压力（0~1.5，越大越激进）
+    HUI_CTRL_KP=8             比例增益（路/单位误差）
+    HUI_CTRL_KI=0.4           积分增益（路/(单位·秒)）
+    HUI_CTRL_KD=0             微分增益（默认关，测量微分）
+    HUI_CTRL_TAU=5            压力测量 EMA 时间常数（秒）
+    HUI_CTRL_UP=1             升并发限速（路/秒）
+    HUI_CTRL_DOWN=2           降并发限速（路/秒，急停时 ×2）
+    HUI_CTRL_FLOOR=2          pid 策略的安全下限（HUI_JOBS_MIN 优先）
+    HUI_CTRL_I_LIMIT=6        积分限幅（路）
+    HUI_CTRL_FF_TAU=15        前馈(可用内存+swap)EMA 时间常数（秒）
+    HUI_CTRL_CPU_FREEZE=70    CPU PSI 超过该值不再升档
+    HUI_CTRL_CPU_DOWN=85      CPU PSI 超过该值小幅降档
+    HUI_CTRL_CPU_MIN_FRACTION=0.5 CPU 降档时不低于核数的该比例
+    HUI_CTRL_RAISE_EPS=0.03   只有压力低于设定值这么多才允许升档
+    HUI_CTRL_HEADROOM_SLACK=1.1 前馈平滑值允许超过瞬时内存上限的比例
+    HUI_CTRL_HOLD=15          急停后多少秒内禁止升档
+    HUI_CTRL_EMERGENCY_PSI=40 急停 PSI 阈值（%）
+    HUI_CTRL_EMERGENCY_SWAP_MB=32 急停换出速率（MB/s）
+    HUI_CTRL_EMERGENCY_CONFIRM=3 换出急停需连续确认的采样数（硬急停不受限）
+    HUI_CTRL_EMERGENCY_AVAIL_MB=1536 急停可用内存（MB）
 
   完整说明：README.md
 

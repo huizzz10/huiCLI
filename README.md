@@ -10,7 +10,7 @@ AOSP / 类原生 ROM 源码树的构建加速工具，随仓库带自建 ninja �
 - **构建图复用**：输入没变就直接读合并图编，跳过 10~15 分钟分析；拿不准就回退完整 `m`。
 - **内核快照**：内核产物按指纹缓存，恢复后 ninja 直接跳过内核（实测 11 秒换 20~30 分钟）。
 - **全屏面板**：构图 / 内核 / ROM 都有阶段、日志与进度；终端太小或非 TTY 自动退回普通输出。
-- **内存准入 + 动态并发**：起手按可用内存算 `-j`，运行中按 PSI 升降；高内存任务和 r8/kotlin/javac/rust 分池。
+- **内存准入 + 动态并发**：起手按「可用内存 + 一半空闲 swap」算 `-j`；运行中是 前馈 + PI(D) 控制器（PSI/换出速率/可见内存），升降限速、抗饱和、急停兜底；高内存任务和 r8/kotlin/javac/rust 分池。
 - **失败兜底**：内核/ROM 阶段 OOM（`Error 137` / `已杀死`）自动降 3 路并发重试一次；无面板也写阶段日志和失败复盘。
 
 ## 安装
@@ -92,6 +92,13 @@ hui clean <codename>       # 只清该设备：出包目录 + 快照
 | `HUI_COMBINE` | `0` | `1` = 内核 + ROM 合成一次 `m` |
 | `HUI_MEM_ADMIT` | `1` | `0` 关内存准入（危险） |
 | `HUI_MEM_PER_JOB` | `1.2` | 每个编译进程按多少 G 估 |
+| `HUI_MEM_SWAP_FRACTION` | `0.5` | 准入时把多少空闲 swap 算作可用内存 |
+| `HUI_ADMIT_POLICY` | `pid` | 运行中准入策略：`pid`（前馈+PI(D)）/ `legacy`（台阶式） |
+| `HUI_CTRL_SETPOINT` / `HUI_CTRL_UP` / `HUI_CTRL_DOWN` | `0.30` / `1` / `2` | PID 目标压力 / 升速 / 降速（路每秒） |
+| `HUI_CTRL_FF_TAU` / `HUI_CTRL_CPU_FREEZE` | `15` / `70` | 前馈平滑时间常数（秒）/ CPU PSI 升档门控（%） |
+| `HUI_CTRL_EMERGENCY_CONFIRM` | `3` | 换出急停需连续确认的采样数（硬急停不受限） |
+| `HUI_GRAPH_JOBS` | 核数一半 | 构图阶段并发（再按内存封顶、≤32，不超过编译并发） |
+| `HUI_CPU_SCALE` | `auto` | 按核数/内存自适应；`off` = 固定 1/2 路每秒、nproc/2 构图 |
 | `HUI_POOLS` / `HUI_POOL_SPEC` | `1` / … | 任务分池开关与预算 |
 | `HUI_WATCHDOG` / `HUI_THROTTLE_AT` | `1` / `35` | 运行中调速开关 / 压力阈值 |
 | `HUI_THEME` / `HUI_WALLPAPER` | `wallpaper` | 面板配色 |
