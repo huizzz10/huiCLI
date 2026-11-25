@@ -33,7 +33,7 @@
 #   （zsh 默认 nomatch：一个不匹配的通配符会直接中断整个函数，这是之前报错的原因）
 # 不会 set -e / 改 setopt，不会污染你的 shell。
 
-HUI_VERSION="5.5.5"
+HUI_VERSION="5.5.6"
 
 # 源码树根，按优先级找：
 #   1. HUI_TOP（vendor/hui/vendorsetup.sh 里用 $T 设好）
@@ -3656,12 +3656,22 @@ hui__graph_ledger_guard() {
     # 这时反而是上一份备份更值钱，不能删）。
     hui__ledger_sync
 
+    # 别让 soong 用 siso 跑 bootstrap：siso 开跑就截断 out/.ninja_log，
+    # 只写它自己那几百条 bootstrap 记录（hash 还是另一套算法），
+    # 主账本 22 万条记录当场就没了。
+    # 换成 AOSP 自带的 ninja 1.9：实测它读 v6 账本不检查版本、原样保留、
+    # 只往后追加新条目，构图结束账本还是 v6，执行器直接增量。
+    # 想回到 siso：HUI_GRAPH_SISO=1。
+    if [ "${HUI_GRAPH_SISO:-0}" != "1" ]; then
+        export SOONG_NINJA=ninja
+    fi
+
     HUI__LEDGER_RESTORED=0
     "$@"
     rc=$?
 
-    # 构图只生成图、不动任何产物，所以 soong bootstrap（siso）把
-    # out/.ninja_log 截成 v5 之后，直接用 v6 备份回滚是安全的。
+    # 兜底：万一构图还是把账本改成了 v5（比如 ninja 侧发生 recompact），
+    # 就用 v6 备份回滚。构图只生成图、不动产物，回滚是安全的。
     if hui__ledger_restore; then
         # 构图在面板子 shell 里跑，这里打的字只会落进阶段日志；
         # 留个标记，让主流程回终端补一句。
@@ -5222,6 +5232,7 @@ hui__help_cmd() {
     HUI_MEM_RESERVE_MB=2048   准入时给系统预留 MB
     HUI_MEM_SWAP_FRACTION=0.5 准入时把多少空闲 swap 算作可用内存
     HUI_GRAPH_JOBS=16         构图阶段并发（默认核数一半，再按内存封顶，≤32）
+    HUI_GRAPH_SISO=1         构图 bootstrap 用回 siso（默认用 AOSP ninja，避免截断账本）
     HUI_CPU_SCALE=auto        按核数/内存自适应（off = 固定 1/2 路每秒、nproc/2 构图）
     HUI_NICE=10               构建进程 nice；0 = 不降
     HUI_IONICE=6              ionice 等级；HUI_IONICE_CLASS=3 = idle
